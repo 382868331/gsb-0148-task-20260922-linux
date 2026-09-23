@@ -577,6 +577,11 @@ def allocate(program: Program, k: int) -> Allocation:
     """
     if not isinstance(program, Program):
         raise ProgramFormatError("allocate: expected a Program instance")
+    if program.var_classes is not None:
+        raise ProgramFormatError(
+            "allocate: this is a v2 program (var_classes is set); "
+            "use allocate2(program, machine)"
+        )
     check_int(k, "K", minimum=MIN_K)
     if k > MAX_K:
         raise ProgramFormatError(f"K: expected integer <= {MAX_K}, got {k}")

@@ -15,6 +15,21 @@ Validation is strict and locatable: every error carries an error path such as
 ``blocks[3].instrs[2].fixed``.  ``bool`` is rejected wherever an int is
 required and float NaN / +/-inf are rejected wherever a finite number is
 required.
+
+Format v2 (register views / exceptional edges)
+----------------------------------------------
+The v1 contract above is unchanged.  A program becomes a *v2 program* by
+passing ``Program(var_classes={...})``; v2 programs are allocated with
+:func:`regalloc.allocate2` against a :class:`regalloc.machine.Machine`.
+V2 adds optional fields (all defaulting to the v1 behaviour):
+
+* ``Instr.early_clobber``: defs written before the uses are read;
+* ``Instr.may_throw`` / ``Block.exc_succs``: exceptional control flow;
+* ``Instr.is_call`` / ``Instr.clobber_views``: machine-level call clobbers;
+* ``Instr.fixed_views``: pin an operand to a named register view.
+
+Using any v2 feature without ``var_classes`` is a format error, and the
+legacy :func:`regalloc.allocate` entry point rejects v2 programs.
 """
 
 from __future__ import annotations
@@ -25,6 +40,7 @@ from typing import Any
 # ---- input interface bounds (contract) ------------------------------------
 
 MAX_BLOCKS = 40
+MAX_BLOCKS_V2 = 128
 MAX_INSTRS_PER_BLOCK = 10_000
 MIN_K = 2
 MAX_K = 8
@@ -98,6 +114,50 @@ def _check_id_tuple(value: Any, path: str, *, unique: bool = True) -> tuple[int,
     return tuple(out)
 
 
+def _check_bool(value: Any, path: str) -> bool:
+    if not isinstance(value, bool):
+        raise _err(path, f"expected bool, got {type(value).__name__}")
+    return value
+
+
+def _check_view_name(value: Any, path: str) -> str:
+    if not isinstance(value, str) or not value:
+        raise _err(path, "expected a non-empty view-name string")
+    return value
+
+
+def _check_view_tuple(value: Any, path: str) -> tuple[str, ...]:
+    if not isinstance(value, (list, tuple)):
+        raise _err(path, f"expected list/tuple, got {type(value).__name__}")
+    out: list[str] = []
+    for i, item in enumerate(value):
+        out.append(_check_view_name(item, f"{path}[{i}]"))
+    if len(out) != len(set(out)):
+        raise _err(path, "duplicate entries are not allowed")
+    return tuple(out)
+
+
+def _check_fixed_views(value: Any, path: str, operands: set[int]) -> dict[int, str]:
+    if not isinstance(value, dict):
+        raise _err(path, "fixed_views must be a dict {var: view_name}")
+    out: dict[int, str] = {}
+    for key, view in value.items():
+        if isinstance(key, bool):
+            raise _err(path, "boolean variable id is not allowed")
+        if isinstance(key, str) and key.lstrip("-").isdigit():
+            v = int(key)
+        elif isinstance(key, int):
+            v = key
+        else:
+            raise _err(path, f"bad variable id key: {key!r}")
+        check_int(v, f"{path}(var)", minimum=0)
+        _check_view_name(view, f"{path}[{v}]")
+        if v not in operands:
+            raise _err(f"{path}[{v}]", "pinned variable must be used or defined here")
+        out[v] = view
+    return out
+
+
 @dataclass(frozen=True)
 class Instr:
     """One three-address instruction.
@@ -108,6 +168,20 @@ class Instr:
     two operands pinned to the same register at one instruction is a proven
     infeasibility.  ``clobbers`` lists registers that a call-like instruction
     destroys.
+
+    V2 extensions (only legal in v2 programs, i.e. when ``Program`` carries
+    ``var_classes``):
+
+    * ``early_clobber``: subset of ``defs`` that are written BEFORE the
+      instruction's uses are read, so an early-clobber def may not share a
+      register view with any use of this instruction;
+    * ``may_throw``: the instruction may transfer control to one of the
+      block's ``exc_succs`` instead of completing normally; on the
+      exceptional path its defs do NOT materialise (its call clobbers do);
+    * ``is_call``: a call; clobbers every machine view that is not
+      callee-saved (plus ``clobber_views``);
+    * ``fixed_views``: like ``fixed`` but pins to a named register view;
+    * ``clobber_views``: extra named views destroyed by this instruction.
     """
 
     uid: int
@@ -116,6 +190,11 @@ class Instr:
     fixed: dict[int, int] = field(default_factory=dict)
     clobbers: tuple[int, ...] = ()
     note: str = ""
+    early_clobber: tuple[int, ...] = ()
+    may_throw: bool = False
+    is_call: bool = False
+    fixed_views: dict[int, str] = field(default_factory=dict)
+    clobber_views: tuple[str, ...] = ()
 
     def __post_init__(self) -> None:
         check_int(self.uid, "uid", minimum=0)
@@ -150,6 +229,30 @@ class Instr:
         object.__setattr__(self, "defs", defs)
         object.__setattr__(self, "fixed", fixed)
         object.__setattr__(self, "clobbers", clobbers)
+        # ---- v2 fields -------------------------------------------------
+        early = _check_id_tuple(self.early_clobber, "early_clobber")
+        bad_early = sorted(set(early) - set(defs))
+        if bad_early:
+            raise _err(
+                "early_clobber",
+                f"early-clobber variables must be defs here: {bad_early}",
+            )
+        object.__setattr__(self, "early_clobber", early)
+        object.__setattr__(self, "may_throw", _check_bool(self.may_throw, "may_throw"))
+        object.__setattr__(self, "is_call", _check_bool(self.is_call, "is_call"))
+        fixed_views = _check_fixed_views(
+            self.fixed_views, "fixed_views", set(uses) | set(defs)
+        )
+        object.__setattr__(self, "fixed_views", fixed_views)
+        object.__setattr__(
+            self, "clobber_views", _check_view_tuple(self.clobber_views, "clobber_views")
+        )
+        if fixed and fixed_views:
+            raise _err("fixed", "cannot mix legacy 'fixed' and v2 'fixed_views'")
+        if clobbers and self.clobber_views:
+            raise _err(
+                "clobbers", "cannot mix legacy 'clobbers' and v2 'clobber_views'"
+            )
 
 
 @dataclass(frozen=True)
@@ -187,6 +290,7 @@ class Block:
     instrs: tuple[Instr, ...]
     succs: tuple[int, ...] = ()
     phis: tuple[PhiNode, ...] = ()
+    exc_succs: tuple[int, ...] = ()
 
     def __post_init__(self) -> None:
         if not isinstance(self.label, str) or not self.label:
@@ -204,6 +308,13 @@ class Block:
                 raise _err(f"blocks[{self.label!r}].instrs[{i}]", "expected Instr")
             norm_instrs.append(ins)
         succs = _check_id_tuple(self.succs, f"blocks[{self.label!r}].succs")
+        exc_succs = _check_id_tuple(self.exc_succs, f"blocks[{self.label!r}].exc_succs")
+        both = sorted(set(succs) & set(exc_succs))
+        if both:
+            raise _err(
+                f"blocks[{self.label!r}].exc_succs",
+                f"a successor cannot be both normal and exceptional: {both}",
+            )
         phis = self.phis
         if not isinstance(phis, (list, tuple)):
             raise _err(f"blocks[{self.label!r}].phis", "expected list/tuple")
@@ -216,6 +327,7 @@ class Block:
             raise _err(f"blocks[{self.label!r}].phis", "two phi nodes define the same variable")
         object.__setattr__(self, "instrs", tuple(norm_instrs))
         object.__setattr__(self, "succs", succs)
+        object.__setattr__(self, "exc_succs", exc_succs)
         object.__setattr__(self, "phis", tuple(norm_phis))
 
 
@@ -224,13 +336,17 @@ class Program:
     blocks: tuple[Block, ...]
     params: tuple[int, ...] = ()
     name: str = ""
+    var_classes: dict[int, str] | None = None
 
     def __post_init__(self) -> None:
         if not isinstance(self.blocks, (list, tuple)) or not self.blocks:
             raise ProgramFormatError("blocks: expected a non-empty list/tuple")
-        if len(self.blocks) > MAX_BLOCKS:
+        # A program is a "v2 program" exactly when var_classes is given.
+        v2 = self.var_classes is not None
+        block_limit = MAX_BLOCKS_V2 if v2 else MAX_BLOCKS
+        if len(self.blocks) > block_limit:
             raise ProgramFormatError(
-                f"blocks: program has {len(self.blocks)} blocks, limit {MAX_BLOCKS}"
+                f"blocks: program has {len(self.blocks)} blocks, limit {block_limit}"
             )
         blocks = tuple(self.blocks)
         for i, b in enumerate(blocks):
@@ -240,23 +356,102 @@ class Program:
         if not isinstance(self.name, str):
             raise _err("name", "name must be a string")
 
+        # ---- var_classes (v2 switch) ------------------------------------
+        norm_classes: dict[int, str] | None = None
+        if v2:
+            if not isinstance(self.var_classes, dict):
+                raise _err("var_classes", "expected a dict {var: class_name} or None")
+            norm_classes = {}
+            for key, cls in self.var_classes.items():
+                if isinstance(key, bool):
+                    raise _err("var_classes", "boolean variable id is not allowed")
+                if isinstance(key, str) and key.lstrip("-").isdigit():
+                    kv = int(key)
+                elif isinstance(key, int):
+                    kv = key
+                else:
+                    raise _err("var_classes", f"bad variable id key: {key!r}")
+                check_int(kv, "var_classes(var)", minimum=0)
+                _check_view_name(cls, f"var_classes[{kv}]")
+                norm_classes[kv] = cls
+
+        # ---- v2-only feature gating --------------------------------------
+        for bi, b in enumerate(blocks):
+            for ii, ins in enumerate(b.instrs):
+                ip = f"blocks[{bi}].instrs[{ii}]"
+                uses_v2 = (
+                    ins.early_clobber
+                    or ins.may_throw
+                    or ins.is_call
+                    or ins.fixed_views
+                    or ins.clobber_views
+                )
+                if uses_v2 and not v2:
+                    raise _err(
+                        ip,
+                        "v2 instruction features (early_clobber/may_throw/is_call/"
+                        "fixed_views/clobber_views) require Program(var_classes=...) "
+                        "and allocate2()",
+                    )
+                if v2 and ins.fixed:
+                    raise _err(
+                        f"{ip}.fixed",
+                        "legacy integer 'fixed' is not allowed in v2 programs; "
+                        "use fixed_views",
+                    )
+                if v2 and ins.clobbers:
+                    raise _err(
+                        f"{ip}.clobbers",
+                        "legacy integer 'clobbers' is not allowed in v2 programs; "
+                        "use is_call/clobber_views",
+                    )
+            if b.exc_succs and not v2:
+                raise _err(
+                    f"blocks[{bi}].exc_succs",
+                    "exceptional successors require Program(var_classes=...) "
+                    "and allocate2()",
+                )
+
         n = len(blocks)
         for i, b in enumerate(blocks):
             for s in b.succs:
                 if s >= n:
                     raise _err(f"blocks[{i}].succs", f"successor {s} out of range (0..{n - 1})")
+            for s in b.exc_succs:
+                if s >= n:
+                    raise _err(
+                        f"blocks[{i}].exc_succs",
+                        f"exceptional successor {s} out of range (0..{n - 1})",
+                    )
+            # exceptional control flow contract: exactly one may_throw
+            # instruction per block with exceptional successors, and no
+            # may_throw instruction without exceptional successors
+            throwers = [ii for ii, ins in enumerate(b.instrs) if ins.may_throw]
+            if b.exc_succs and len(throwers) != 1:
+                raise _err(
+                    f"blocks[{i}]",
+                    "a block with exc_succs must contain exactly one "
+                    "may_throw instruction",
+                )
+            if throwers and not b.exc_succs:
+                raise _err(
+                    f"blocks[{i}].instrs[{throwers[0]}]",
+                    "may_throw instruction requires the block to declare exc_succs",
+                )
 
         preds: list[set[int]] = [set() for _ in range(n)]
         for i, b in enumerate(blocks):
             for s in b.succs:
                 preds[s].add(i)
+            for s in b.exc_succs:
+                preds[s].add(i)
 
-        # reachability from entry block 0
+        # reachability from entry block 0 (normal + exceptional edges)
         seen = {0}
         stack = [0]
         while stack:
             cur = stack.pop()
-            for s in blocks[cur].succs:
+            for s in blocks[cur].succs + blocks[cur].exc_succs:
                 if s not in seen:
                     seen.add(s)
                     stack.append(s)
@@ -300,6 +495,13 @@ class Program:
         unknown = sorted(referenced - defined)
         if unknown:
             raise _err("blocks", f"variable(s) never defined and not parameters: {unknown}")
+        if norm_classes is not None:
+            bad_keys = sorted(set(norm_classes) - defined)
+            if bad_keys:
+                raise _err(
+                    "var_classes",
+                    f"class given for variable(s) not in the program: {bad_keys}",
+                )
         phi_defs = {phi.def_var for b in blocks for phi in b.phis}
         if set(params) & phi_defs:
             raise _err("params", "a parameter cannot also be a phi definition")
@@ -317,6 +519,7 @@ class Program:
 
         object.__setattr__(self, "blocks", blocks)
         object.__setattr__(self, "params", params)
+        object.__setattr__(self, "var_classes", norm_classes)
 
     def var_count(self) -> int:
         """One past the largest variable id used (ids may be sparse)."""
@@ -345,13 +548,19 @@ def program_from_dict(data: Any) -> Program:
 
     Expected shape::
 
-        {"name": str?, "params": [int]?,
+        {"name": str?, "params": [int]?, "var_classes": {"0": "w"}?,
          "blocks": [{"label": str?,
                      "instrs": [{"uid": int, "uses": [int], "defs": [int],
                                  "fixed": {"0": 1}, "clobbers": [int],
+                                 "early_clobber": [int], "may_throw": bool,
+                                 "is_call": bool, "fixed_views": {"0": "w0"},
+                                 "clobber_views": ["w1"],
                                  "note": str?}],
-                     "succs": [int],
+                     "succs": [int], "exc_succs": [int]?,
                      "phis": [{"def": int, "sources": [[pred, src], ...]}]}]}
+
+    The v2 keys are optional; a dict without them builds exactly the v1
+    program it always did.
     """
     if not isinstance(data, dict):
         raise _err("program", "expected a mapping/object")
@@ -382,6 +591,11 @@ def program_from_dict(data: Any) -> Program:
                         fixed=dict(idata.get("fixed", {})),
                         clobbers=tuple(idata.get("clobbers", ())),
                         note=str(idata.get("note", "")),
+                        early_clobber=tuple(idata.get("early_clobber", ())),
+                        may_throw=idata.get("may_throw", False),
+                        is_call=idata.get("is_call", False),
+                        fixed_views=dict(idata.get("fixed_views", {})),
+                        clobber_views=tuple(idata.get("clobber_views", ())),
                     )
                 )
             except ProgramFormatError as exc:
@@ -413,11 +627,22 @@ def program_from_dict(data: Any) -> Program:
                 instrs=tuple(instrs),
                 succs=tuple(bd.get("succs", ())),
                 phis=tuple(phis),
+                exc_succs=tuple(bd.get("exc_succs", ())),
             )
         )
     params = tuple(data.get("params", ()))
+    var_classes = data.get("var_classes", None)
+    if var_classes is not None:
+        if not isinstance(var_classes, dict):
+            raise _err("var_classes", "expected an object {var: class_name}")
+        var_classes = {k: v for k, v in var_classes.items()}
     try:
-        return Program(blocks=tuple(blocks), params=params, name=str(data.get("name", "")))
+        return Program(
+            blocks=tuple(blocks),
+            params=params,
+            name=str(data.get("name", "")),
+            var_classes=var_classes,
+        )
     except ProgramFormatError as exc:
         # make instr-level paths locatable when constructed from raw blocks
         raise exc

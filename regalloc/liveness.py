@@ -209,3 +209,146 @@ def liveness_with_phis(program: Program) -> LivenessReport:
         instr_before=tuple(instr_before),
         instr_after=tuple(instr_after),
     )
+
+
+def predecessors_v2(blocks: tuple[Block, ...]) -> list[list[int]]:
+    """Predecessors over normal AND exceptional edges (v2)."""
+    preds: list[list[int]] = [[] for _ in blocks]
+    for i, b in enumerate(blocks):
+        for s in b.succs:
+            preds[s].append(i)
+        for s in b.exc_succs:
+            preds[s].append(i)
+    for lst in preds:
+        lst.sort()
+    return preds
+
+
+def throw_index(block: Block) -> int | None:
+    """Index of the block's may_throw instruction, or None."""
+    for i, ins in enumerate(block.instrs):
+        if ins.may_throw:
+            return i
+    return None
+
+
+def liveness_v2(program: Program) -> LivenessReport:
+    """Edge-sensitive liveness for v2 programs (exceptional control flow).
+
+    Normal edges behave exactly as in :func:`liveness_with_phis`.  An
+    exceptional edge ``p -> q`` leaves block ``p`` at its may_throw
+    instruction ``t`` (which need not be the last instruction):
+
+    * the exceptional edge live set is
+      ``(in(q) - phiDefs(q)) ∪ phiSrcs(p -> q)``, taken at the program
+      point immediately after instruction ``t``;
+    * values needed on the exceptional edge become live before ``t`` and
+      propagate to ``p``'s live-in (a value read by a handler must survive
+      the potentially-throwing call);
+    * ``instr_after[t]`` is the union of the normal and the exceptional
+      continuations (a conservative may-set; documented, sound);
+    * instructions after ``t`` in the same block are normal-path-only.
+
+    The fixpoint iterates blocks in ascending index order; results are
+    deterministic.
+    """
+    blocks = program.blocks
+    n = len(blocks)
+
+    phi_defs: list[set[int]] = []
+    sources_on_edge: dict[tuple[int, int], list[int]] = {}
+    for i, b in enumerate(blocks):
+        d: set[int] = set()
+        for phi in b.phis:
+            d.add(phi.def_var)
+            for p, src in phi.sources:
+                sources_on_edge.setdefault((i, p), []).append(src)
+        phi_defs.append(d)
+
+    def edge_set(pred: int, succ: int) -> set[int]:
+        return (live_in[succ] - phi_defs[succ]) | set(
+            sources_on_edge.get((succ, pred), ())
+        )
+
+    throw_at = [throw_index(b) for b in blocks]
+
+    live_in: list[set[int]] = [set() for _ in range(n)]
+    live_out: list[set[int]] = [set() for _ in range(n)]
+    changed = True
+    while changed:
+        changed = False
+        for i in range(n):
+            b = blocks[i]
+            new_out: set[int] = set()
+            for s in b.succs:
+                new_out |= edge_set(i, s)
+            # backward scan; inject exceptional requirements at the throw
+            live = set(new_out)
+            t = throw_at[i]
+            if t is None:
+                for k in range(len(b.instrs) - 1, -1, -1):
+                    ins = b.instrs[k]
+                    live = (live - set(ins.defs)) | set(ins.uses)
+            else:
+                for k in range(len(b.instrs) - 1, t, -1):
+                    ins = b.instrs[k]
+                    live = (live - set(ins.defs)) | set(ins.uses)
+                for q in b.exc_succs:
+                    live |= edge_set(i, q)
+                for k in range(t, -1, -1):
+                    ins = b.instrs[k]
+                    live = (live - set(ins.defs)) | set(ins.uses)
+            new_in = live - phi_defs[i]
+            if new_out != live_out[i] or new_in != live_in[i]:
+                live_out[i] = set(new_out)
+                live_in[i] = set(new_in)
+                changed = True
+
+    edge_live: dict[tuple[int, int], frozenset[int]] = {}
+    for i, b in enumerate(blocks):
+        for s in b.succs:
+            edge_live[(i, s)] = frozenset(edge_set(i, s))
+        for q in b.exc_succs:
+            edge_live[(i, q)] = frozenset(edge_set(i, q))
+
+    # Per-instruction sets, recomputed from the same equations.
+    instr_before: list[tuple[frozenset[int], ...]] = []
+    instr_after: list[tuple[frozenset[int], ...]] = []
+    for i, b in enumerate(blocks):
+        live: set[int] = set()
+        for s in b.succs:
+            live |= edge_live[(i, s)]
+        t = throw_at[i]
+        befores: list[frozenset[int]] = [frozenset()] * len(b.instrs)
+        afters: list[frozenset[int]] = [frozenset()] * len(b.instrs)
+        if t is None:
+            for k in range(len(b.instrs) - 1, -1, -1):
+                ins = b.instrs[k]
+                afters[k] = frozenset(live)
+                live = (live - set(ins.defs)) | set(ins.uses)
+                befores[k] = frozenset(live)
+        else:
+            for k in range(len(b.instrs) - 1, t, -1):
+                ins = b.instrs[k]
+                afters[k] = frozenset(live)
+                live = (live - set(ins.defs)) | set(ins.uses)
+                befores[k] = frozenset(live)
+            for q in b.exc_succs:
+                live |= set(edge_live[(i, q)])
+            for k in range(t, -1, -1):
+                ins = b.instrs[k]
+                afters[k] = frozenset(live)
+                live = (live - set(ins.defs)) | set(ins.uses)
+                befores[k] = frozenset(live)
+        entry = frozenset(live - phi_defs[i])
+        assert entry == frozenset(live_in[i]), (i, entry, live_in[i])
+        instr_before.append(tuple(befores))
+        instr_after.append(tuple(afters))
+
+    return LivenessReport(
+        live_in=tuple(frozenset(s) for s in live_in),
+        live_out=tuple(frozenset(s) for s in live_out),
+        edge_live=edge_live,
+        instr_before=tuple(instr_before),
+        instr_after=tuple(instr_after),
+    )
