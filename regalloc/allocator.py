@@ -566,8 +566,41 @@ class Allocation:
     history: tuple[tuple[int, ...], ...]
 
 
-def allocate(program: Program, k: int) -> Allocation:
-    """Allocate ``program`` to ``k`` physical registers.
+def allocate(program: Program, k: int = None):
+    """Allocate ``program``.
+
+    * format v1 (the original numeric-register contract): requires
+      ``allocate(program, K)`` with ``2 <= K <= 8``;
+    * format v2 (target descriptions / width views): the physical register
+      set comes from the program's :class:`~regalloc.target.TargetDesc`;
+      ``K`` is not accepted and the v2 pipeline
+      (:func:`regalloc.allocator2.allocate_v2`) is used, returning an
+      :class:`~regalloc.allocator2.AllocationV2`.
+
+    Raises:
+        ProgramFormatError: bad program/K.
+        InfeasibleProgramError: constraints proven contradictory.
+        BudgetExhaustedError: search budget exhausted (feasibility unknown).
+        VerificationFailureError: produced program failed the independent
+            per-edge bit-level checker (no machine program is returned).
+    """
+    if not isinstance(program, Program):
+        raise ProgramFormatError("allocate: expected a Program instance")
+    if program.is_v2():
+        if k is not None:
+            raise ProgramFormatError(
+                "K: a version=2 program takes its register set from its target "
+                "description; do not pass K"
+            )
+        from .allocator2 import allocate_v2
+        return allocate_v2(program)
+    if k is None:
+        raise ProgramFormatError("K: allocate(program, K) requires K for a v1 program")
+    return _allocate_v1(program, k)
+
+
+def _allocate_v1(program: Program, k: int) -> Allocation:
+    """Allocate ``program`` to ``k`` physical registers (format v1).
 
     Raises:
         ProgramFormatError: bad program/K (K outside 2..8, bool, NaN-like).
@@ -575,8 +608,6 @@ def allocate(program: Program, k: int) -> Allocation:
         BudgetExhaustedError: coloring search budget exhausted (feasibility
             unknown).
     """
-    if not isinstance(program, Program):
-        raise ProgramFormatError("allocate: expected a Program instance")
     check_int(k, "K", minimum=MIN_K)
     if k > MAX_K:
         raise ProgramFormatError(f"K: expected integer <= {MAX_K}, got {k}")
