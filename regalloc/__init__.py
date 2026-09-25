@@ -24,6 +24,12 @@ from .allocator import (
     allocate,
 )
 from .liveness import LivenessReport
+from .profile import (
+    edge_frequencies,
+    memory_traffic,
+    normalize_frequencies,
+    spill_costs,
+)
 
 __all__ = [
     "allocate",
@@ -37,4 +43,8 @@ __all__ = [
     "ProgramFormatError",
     "InfeasibleProgramError",
     "BudgetExhaustedError",
+    "edge_frequencies",
+    "memory_traffic",
+    "normalize_frequencies",
+    "spill_costs",
 ]

@@ -15,13 +15,21 @@
 
 ## 准确命令
 
-```bash
-# 运行必要测试
-python -m unittest discover -s tests -v
+在 Linux 原生 Python 3.14.7 的隔离环境中运行（只依赖标准库）：
 
-# 运行固定输入演示（真实计算；本机约 0.05 秒，远小于 8 秒预算）
-python demo.py
+```bash
+# 创建一次性隔离环境（无需任何第三方依赖；若已存在可跳过）
+python3.14 -m venv .venv
+
+# 运行必要测试（回归入口）
+./.venv/bin/python -m unittest discover -s tests -v
+
+# 运行固定输入演示（真实计算；本机约 0.1 秒，远小于 90 秒预算）
+./.venv/bin/python demo.py
 ```
+
+不使用 `.venv` 时，系统 `python3`（3.14.7）也可直接运行同样两条命令；
+演示与测试均不访问网络、不读取环境变量或凭据。
 
 ## 公开接口与数据结构
 
@@ -30,8 +38,15 @@ from regalloc import allocate, Program, Block, Instr, PhiNode, program_from_dict
 from regalloc import (RegAllocError, ProgramFormatError,
                      InfeasibleProgramError, BudgetExhaustedError)
 
-alloc = allocate(program, K)        # K 为 2..8 的 int（拒绝 bool / float）
+alloc = allocate(program, K)                 # K 为 2..8 的 int（拒绝 bool / float）
+alloc = allocate(program, K, frequencies=f)  # 可选：每块非负整数执行频次
 ```
+
+- `frequencies`：长度**恰好等于块数**的非负 `int` 序列（list/tuple，
+  逐块对应，块 0 为入口）。语义是纯启发式输入——只影响“寄存器不足时
+  先 spill 谁”，**不改变合法性、不改变程序语义**；非法形状给
+  `ProgramFormatError`（块数不符、`bool`、负数、float、非序列都拒绝）。
+  省略或传 `None` 时，走原有的循环深度加权策略，结果与旧版逐字节一致。
 
 - `Program(blocks, params=(), name="")`
   - `blocks`：`Block` 元组，块 0 为唯一入口；给出 `succs`（后继**块下标**）。
@@ -60,6 +75,9 @@ alloc = allocate(program, K)        # K 为 2..8 的 int（拒绝 bool / float�
 | `allocated_program` | 寄存器级 CFG（`AllocatedProgram`，可用 `.render()` 打印） |
 | `liveness` | `LivenessReport`：块 live-in/live-out、**每条边**活跃集、每条指令 before/after 活跃集 |
 | `iterations` / `history` | spill 迭代次数与每轮被 spill 的变量序列 |
+| `frequencies` / `edge_frequencies` | 实际使用的块频次与由其估计的**边频次**；未给 profile 时均为 `None` |
+| `cost_history` | **每轮启发式估计**的候选 spill 加权 reload/store 成本（仅用于选受害者，不是收益） |
+| `memory` | 从最终机器指令**实际清点**的访存统计：`loads/stores/total`（原始条数）、`weighted_loads/weighted_stores/weighted_total`（按块/边频次加权）、`by_site`（逐块/逐拆分边明细，可手工核对） |
 
 寄存器级指令只有四类：`op`（原指令，含 `reads/writes/clobbers`）、
 `copy`、`load r <- slot`、`store slot <- r`。
@@ -74,6 +92,9 @@ alloc = allocate(program, K)        # K 为 2..8 的 int（拒绝 bool / float�
   如 `blocks[3].instrs[2].fixed[1]: register 3 does not exist for K=3`；
   不做静默纠正。
 - `K` 必须在 **2..8**；`fixed` / `clobbers` 中的寄存器必须 `< K`。
+- `frequencies` 省略或为 `None` 时走旧策略；给定时必须是长度等于块数的
+  非负整数序列，拒绝 `bool` / `float` / 负数 / 长度不符 / 非序列，
+  错误路径形如 `frequencies[3]: expected integer, got bool`。
 - **输入规模上限**：最多 **40 个块**；单块最多 10,000 条指令。
 - 两类“无解”严格分开：
   - `InfeasibleProgramError`：**证明无解**。例如一条指令在同一读点需要
@@ -114,11 +135,34 @@ alloc = allocate(program, K)        # K 为 2..8 的 int（拒绝 bool / float�
    能真正证明 K-不可染（返回 `infeasible`）或在预算耗尽时返回 `budget`。
    节点选择按（饱和度, 度, id）确定排序，故同一输入结果可复现。
 
-4. **迭代 spill**：每次证明不可染后，按
+4. **迭代 spill（旧策略，默认）**：每次证明不可染后，按
    `(冲突度+1) / 加权使用频次`（循环内使用按 10 的循环嵌套深度次方加权）
    选最大者 spill，随后**从零重建活跃性与冲突图**。
    栈槽按变量 id 分配。超过寄存器数的参数按“栈传递 ABI”处理：
    其值入口即位于自己的栈槽。
+
+4b. **按块频次选择 spill 对象（新增，`frequencies=` 开启）**：频次是调用方
+   给的非负整数（如热点循环体给大数、冷错误分支给小数），只影响启发式。
+   - **边频次估计**（`profile.edge_frequencies`）：唯一后继边取整个块频次；
+     唯一前驱边取 `min(前驱频次, 本块频次)`（冷块不被热前驱平均抬高，零
+     永远传零）；回边 `latch -> header` 取
+     `max(0, 头频次 - 已知前向入边之和)`；其余 fork/join 边把残余频次均分
+     （余数按下标顺序派发）。全部整数运算，无浮点。
+   - **候选成本估计**（`profile.spill_costs`，每轮重算）：按当前 spill 形式
+     的真实 use/def 点计数——块内每次 use 一次 reload、每次 def 一次
+     store（权=块频次）；phi 结果/源在其绑定的前驱边上各一次 store/reload
+     （权=边频次）。这是**启发式估计**，仅用于选受害者。
+   - **同样冲突条件优先挑代价较低者**：候选限定为冲突图的 **K-核**
+     （反复剥离度数 < K 的可平凡着色节点；预着色伪节点常驻、reload/store
+     临时量可剥离），核内按精确分数 `度数 / 估计加权访存成本` 取最大，
+     平局按变量 id。固定寄存器伪节点、call 破坏伪节点和临时量都不是
+     real node，永不被 spill；不可 spill 约束与固定/call 约束继续由图结构
+     强制满足。
+   - **每轮重写后从零重建活跃性、spill 形式与成本**，不会拿旧图反复溢出
+     同一临时变量；染色预算耗尽仍明确抛 `BudgetExhaustedError`。
+   - **收益按实际插入的 reload/store 统计**（`Allocation.memory`），从最终
+     降级机器指令逐条清点（块内指令按块频次、临界边拆分块按边频次加权），
+     绝不把启发式估计充当最终收益。
 
 5. **Phi 降级与临界边**（`lower.py`）：
    - 前驱只有一个后继时，边动作追加到该前驱尾部；否则该边为**临界边**，
@@ -145,6 +189,23 @@ alloc = allocate(program, K)        # K 为 2..8 的 int（拒绝 bool / float�
 覆盖要点：临界边 phi（含自环）、跨 call 活跃值、固定寄存器碰撞、
 寄存器不足触发 spill、预算耗尽与证明无解分离、严格输入拒绝、确定性与可复现。
 
+### 新增能力的独立验证（按块频次选择 spill）
+
+- `regalloc/concrete.py` 是第二个独立验证器：用真实整数输入分别执行
+  **原程序**和**分配后程序**的微型具体解释器（opcode 由 `note` 给出：
+  `const/add/sub/mul/lt/br2/br3`），比较 uid 序列、块轨迹与出口可见值。
+  它不调用分配器核心，也不与 `symbolic.py` 共享执行逻辑。
+- 热点演示程序 `sample_hot_loop_cold_error()` 是一个带**冷错误恢复臂**的
+  热循环（冷臂与热闩在静态上同循环深度，旧策略无法区分）。演示对同一
+  程序分别用“热闩/冷错误”频次和**完全相反**的频次各分配一次：
+  - 用真实输入独立跑两条路径（纯热路径、进入冷恢复的路径），三种分配
+    （旧策略 / HOT profile / 反向 COLD profile）与原程序结果逐一一致；
+  - 以同一频次把两种分配的**实际**机器指令加权清点：HOT profile 下热点
+    加权访存约下降 ~50%，反向 profile 下冷臂访存下降 ~99%（精确数值以
+    `./.venv/bin/python demo.py` 实跑为准，不是预录值）；
+  - 另有手工布局核对：单块小程序里栈传参数的 reload 数、定义点的
+    store 数与加权统计逐条对得上（`tests/test_profile.py`）。
+
 ## 数值口径
 
 本模块的输出是离散的寄存器/栈槽指派与符号 token，**不产生任何浮点结果**，
@@ -164,6 +225,10 @@ alloc = allocate(program, K)        # K 为 2..8 的 int（拒绝 bool / float�
   `bound_reached`；这是**覆盖**界限而非数值容差。
 - 块数上限 40、单块指令上限 10,000 是接口边界；演示用例规模很小，
   未穷举上限规模，也不做长时压力测试。
+- 块频次是启发式权重而非真实分支概率：边频次用结构性规则估计（唯一前驱
+  /回边流平衡/均分），手写 profile 若内部流不一致，估计按裁剪规则归一，
+  不会因此报错或产生浮点；该输入只影响 spill 选择，**不宣称全局最优**，
+  只保证同冲突条件下倾向加权访存更便宜的候选，平局按变量 id。
 
 ## 目录
 
@@ -171,10 +236,12 @@ alloc = allocate(program, K)        # K 为 2..8 的 int（拒绝 bool / float�
 regalloc/
   model.py      数据结构 + 严格输入校验 + 错误类型
   liveness.py   边敏感活跃性（含 phi / 无 phi 两种）
-  allocator.py  冲突图、贪心+精确染色、迭代 spill、allocate()
+  allocator.py  冲突图、贪心+精确染色、迭代 spill、按频次选 spill、allocate()
+  profile.py    频次校验、边频次估计、加权 spill 成本估计、实际访存统计
   lower.py      临界边拆分、并行拷贝顺序化、寄存器/栈代码生成
   symbolic.py   独立配对符号执行器（前后程序对照）
-  samples.py    确定性示例与固定种子程序生成器
-tests/          必要测试（含独立参考 _reference.py 与变异用例）
-demo.py         固定输入演示：正常 spill 结果 + 实际触发的拒绝边界
+  concrete.py   独立具体执行器（真实整数输入，前后程序结果对照）
+  samples.py    确定性示例与固定种子程序生成器（含热循环/冷错误用例）
+tests/          必要测试（含独立参考 _reference.py 与变异用例、频次用例）
+demo.py         固定输入演示：正常 spill、call、频次引导 spill、拒绝边界
 ```

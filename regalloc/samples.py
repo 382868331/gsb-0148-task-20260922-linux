@@ -151,6 +151,105 @@ def sample_loop_call() -> Program:
     return Program(blocks=(b0, b1, b2), params=(0,), name="loop-call")
 
 
+def sample_hot_loop_cold_error() -> Program:
+    """Hot loop with a cold error-recovery arm inside the same loop nest.
+
+    Statically the cold arm sits at the same loop depth as the hot latch, so
+    the legacy loop-depth heuristic cannot tell them apart; only an explicit
+    block-frequency profile separates them.  Two seeds are live across the
+    whole loop: ``v2`` (cold recovery seed, used three times but only on the
+    error arm) and ``v15`` (hot seed, used three times in the latch).
+
+    Parameters: ``v0`` step, ``v1`` termination limit, ``v25`` error
+    threshold.  Blocks::
+
+        0 entry  : v2=7, v3=0, v15=1                   -> 1
+        1 loop   : phi v4 = v3 | v8
+                   v5 = v4 + v0(step)
+                   v7 = (v25(threshold) < v5)          # overflow => error
+                   br2 v7: !=0 -> 3(cold) else 2(latch)
+        3 cold   : v9  = v5 + v0
+                   v10 = v9 + v2
+                   v11 = v10 + v2
+                   v12 = v11 + v2                      -> 2
+        2 latch  : phi v6 = v5 | v12
+                   v8  = v6 + v0
+                   v16 = v8 + v15
+                   v17 = v16 + v15
+                   v18 = v17 + v15
+                   v13 = (v8 < v1)
+                   br2 v13: !=0 -> 1(loop) else 4(exit)
+        4 exit   : v14 = v8 + v1
+
+    Concrete runs (see regalloc.concrete): ``(step, limit, threshold)`` =
+    ``(3, 100, 1000)`` stays on the hot path and terminates; ``(300, 1000,
+    100)`` enters the cold recovery arm (twice) before terminating.  Both
+    paths are exercised by the demo and the tests.
+    """
+    b0 = Block(
+        label="entry",
+        instrs=(
+            Instr(uid=0, uses=(), defs=(2,), note="const:7"),   # cold seed
+            Instr(uid=1, uses=(), defs=(3,), note="const:0"),   # acc init
+            Instr(uid=2, uses=(), defs=(15,), note="const:1"),  # hot seed
+        ),
+        succs=(1,),
+    )
+    b1 = Block(
+        label="loop",
+        instrs=(
+            Instr(uid=3, uses=(4, 0), defs=(5,), note="add"),
+            Instr(uid=4, uses=(25, 5), defs=(7,), note="lt"),
+            Instr(uid=5, uses=(7,), defs=(), note="br2"),
+        ),
+        succs=(3, 2),
+        phis=(PhiNode(def_var=4, sources=((0, 3), (2, 8))),),
+    )
+    b3 = Block(
+        label="cold",
+        instrs=(
+            Instr(uid=6, uses=(5, 0), defs=(9,), note="add"),
+            Instr(uid=7, uses=(9, 2), defs=(10,), note="add"),
+            Instr(uid=8, uses=(10, 2), defs=(11,), note="add"),
+            Instr(uid=9, uses=(11, 2), defs=(12,), note="add"),
+        ),
+        succs=(2,),
+    )
+    b2 = Block(
+        label="latch",
+        instrs=(
+            Instr(uid=10, uses=(6, 0), defs=(8,), note="add"),
+            Instr(uid=11, uses=(8, 15), defs=(16,), note="add"),
+            Instr(uid=12, uses=(16, 15), defs=(17,), note="add"),
+            Instr(uid=13, uses=(17, 15), defs=(18,), note="add"),
+            Instr(uid=14, uses=(8, 1), defs=(13,), note="lt"),
+            Instr(uid=15, uses=(13,), defs=(), note="br2"),
+        ),
+        succs=(1, 4),
+        phis=(PhiNode(def_var=6, sources=((1, 5), (3, 12))),),
+    )
+    b4 = Block(
+        label="exit",
+        instrs=(Instr(uid=16, uses=(8, 1), defs=(14,), note="add"),),
+        succs=(),
+    )
+    return Program(
+        blocks=(b0, b1, b2, b3, b4),
+        params=(0, 1, 25),
+        name="hot-loop-cold-error",
+    )
+
+
+# Frequency profiles for the fixture above, one entry per block index
+# (entry, loop, latch, cold, exit).  HOT_PROFILE models a loop body executed
+# ~1000x with a rare error arm; COLD_PROFILE is the exact inversion (the
+# recovery arm is the hot path and the latch is cold).
+HOT_PROFILE = (1, 1000, 1000, 1, 1)
+COLD_PROFILE = (1, 1, 1, 1000, 1)
+HOT_PARAMS = {0: 3, 1: 100, 25: 1000}
+COLD_PARAMS = {0: 300, 1: 1000, 25: 100}
+
+
 def generate_pressure_program(seed: int = 20260922, *, width: int = 5,
                               clobber: bool = True) -> Program:
     """Deterministically generated straight-line pressure program.

@@ -331,6 +331,11 @@ def build_virtual_program(program: Program, spilled: set[int]) -> VirtualProgram
                 s = dict(phi.sources)[p]
                 if d in S:
                     if s in S:
+                        if s == d:
+                            # identity edge assignment slot{d} <- slot{d}:
+                            # the value already waits in its own slot, so no
+                            # load/store is needed on this edge at all.
+                            continue
                         t = new_temp()
                         ep.loads.append(("load", t, s))
                         ep.stores.append(("store", t, d))
@@ -528,26 +533,99 @@ class _Budget(Exception):
 # spill selection / iteration
 # --------------------------------------------------------------------------
 
-def _spill_victim(vp: VirtualProgram, program: Program, weights: dict[int, int]) -> int:
-    """Spill the variable with the highest (degree+1)/use-weight.
+def _spill_victim(
+    vp: VirtualProgram,
+    program: Program,
+    costs: dict[int, int],
+    *,
+    profile: bool,
+    k: int = 0,
+) -> int:
+    """Choose the variable to spill next.
 
-    High interference degree makes spilling it relieve the most pressure; a
-    small weighted use count makes it cheap.  A spilled parameter is stored
-    to its slot at entry, so parameters are spillable too.  Deterministic
-    tie break: smaller variable id.
+    Legacy mode (``profile=False``): the variable maximising
+    ``(degree+1)/occurrence-weight`` -- the original strategy over every real
+    node with the original float comparison, so unprofiled allocation results
+    are bit-for-bit unchanged.
+
+    Frequency mode (``profile=True``): "same conflict conditions, the cheaper
+    candidate first".  Spilling is only reached after the K-coloring is
+    *proven* impossible.  Candidates are restricted to the graph's K-core
+    (:func:`_constrained_core`): a node the simplification process peels
+    while its degree is below K is trivially colourable regardless of the
+    rest, and spilling it can never resolve the pressure -- without this
+    restriction a cheap cold-path temporary could be gutted again and again
+    without ever touching the hot, constrained region.  Among K-core nodes
+    the victim maximises the exact rational
+
+        degree(v) / estimated_weighted_reload_store_cost(v)
+
+    i.e. most pressure relief per unit of profile-weighted memory traffic.
+    A zero cost (the variable only occurs on weight-0 blocks/edges) spills
+    for free and always wins.  Equal ratios break by the smaller variable id.
+    Fixed/clobber pseudo nodes and reload/store temporaries are never real
+    nodes, so they are never candidates; an empty core defensively falls back
+    to every real node (it cannot follow a proven-infeasible coloring).
     """
-    candidates = sorted(vp.real_nodes)
-    if not candidates:
+    all_real = sorted(vp.real_nodes)
+    if not all_real:
         raise InfeasibleProgramError(
             "no variables remain to spill but the coloring constraints are "
             "unsatisfiable: proven no allocation exists"
         )
 
-    def score(v: int) -> tuple[float, int]:
-        w = weights.get(v, 1)
-        return ((len(vp.adj[v]) + 1) / w, -v)
+    if not profile:
+        def legacy_score(v: int) -> tuple[float, int]:
+            w = costs.get(v, 1)
+            return ((len(vp.adj[v]) + 1) / w, -v)
 
-    return max(candidates, key=score)
+        return max(all_real, key=legacy_score)
+
+    candidates = _constrained_core(vp, k) or all_real
+
+    def better(v: int, best: int) -> bool:
+        nv, cv = len(vp.adj[v]), costs.get(v, 0)
+        nb, cb = len(vp.adj[best]), costs.get(best, 0)
+        # exact comparison of nv/cv vs nb/cb; a zero denominator is +infinity
+        if cv == 0 or cb == 0:
+            if (cv == 0) != (cb == 0):
+                return cv == 0
+        elif nv * cb != nb * cv:
+            return nv * cb > nb * cv
+        return v < best  # tie: smaller variable id
+
+    best = candidates[0]
+    for v in candidates[1:]:
+        if better(v, best):
+            best = v
+    return best
+
+
+def _constrained_core(vp: VirtualProgram, k: int) -> list[int]:
+    """Real variables in the graph's K-core (the pressure-constrained set).
+
+    Nodes are repeatedly removed while their *current* degree is below K;
+    precolored pseudo nodes are permanent (they always consume a concrete
+    colour), everything else -- including reload/store temporaries -- may
+    peel.  Every peeled node is simplifiable regardless of how the remaining
+    core is coloured, so spilling one could never resolve a proven
+    K-infeasibility.  The surviving variables are exactly those under "the
+    same conflict conditions": a profiled spill must come from this set.
+    Real nodes only are returned (pseudos/temps cannot be spilled).
+    """
+    adj = vp.adj
+    alive = set(adj)
+    deg = {v: len(ns) for v, ns in adj.items()}
+    while True:
+        peel = [v for v in alive if v not in vp.precolor and deg[v] < k]
+        if not peel:
+            break
+        for v in peel:
+            alive.discard(v)
+            for u in adj[v]:
+                if u in alive:
+                    deg[u] -= 1
+    return sorted(v for v in alive if v in vp.real_nodes)
 
 
 # --------------------------------------------------------------------------
@@ -564,13 +642,38 @@ class Allocation:
     liveness: "object"
     iterations: int
     history: tuple[tuple[int, ...], ...]
+    frequencies: tuple[int, ...] | None = None
+    edge_frequencies: "dict[tuple[int, int], int] | None" = None
+    # Per-iteration heuristic spill-cost estimates (victim-choice inputs);
+    # estimates only, never quoted as delivered savings.
+    cost_history: tuple[dict[int, int], ...] = ()
+    # Actual weighted load/store traffic of the lowered program, counted from
+    # emitted machine instructions (see regalloc.profile.memory_traffic).
+    memory: dict = None
 
 
-def allocate(program: Program, k: int) -> Allocation:
+def allocate(
+    program: Program,
+    k: int,
+    *,
+    frequencies: "tuple[int, ...] | None" = None,
+) -> Allocation:
     """Allocate ``program`` to ``k`` physical registers.
 
+    Args:
+        program: the three-address CFG to allocate.
+        k: number of physical registers (2..8).
+        frequencies: optional non-negative integer block-execution-frequency
+            profile, one entry per block (block 0 = entry).  Frequencies are
+            a heuristic-only input: they change *which* variable is spilled
+            when spilling is unavoidable, never the program semantics or the
+            set of legal allocations.  ``None`` (the default) selects the
+            original loop-depth-weighted strategy; results for an unprofiled
+            call are unchanged.
+
     Raises:
-        ProgramFormatError: bad program/K (K outside 2..8, bool, NaN-like).
+        ProgramFormatError: bad program/K (K outside 2..8, bool, NaN-like) or
+            a malformed ``frequencies`` vector.
         InfeasibleProgramError: constraints proven contradictory.
         BudgetExhaustedError: coloring search budget exhausted (feasibility
             unknown).
@@ -580,6 +683,12 @@ def allocate(program: Program, k: int) -> Allocation:
     check_int(k, "K", minimum=MIN_K)
     if k > MAX_K:
         raise ProgramFormatError(f"K: expected integer <= {MAX_K}, got {k}")
+
+    from .profile import edge_frequencies, normalize_frequencies, spill_costs
+
+    block_freq = normalize_frequencies(program, frequencies)
+    use_profile = block_freq is not None
+    edge_freq = edge_frequencies(program, block_freq) if use_profile else None
 
     # every fixed/clobber register must fit K
     for bi, b in enumerate(program.blocks):
@@ -615,14 +724,26 @@ def allocate(program: Program, k: int) -> Allocation:
                     f"outputs at once but K={k} (proven infeasible)"
                 )
 
-    weights = _occurrence_weights(program)
+    # Legacy strategy: static loop-depth-weighted occurrence counts.  With a
+    # frequency profile the per-candidate costs are instead recomputed from
+    # the freshly rebuilt spill form on every iteration.
+    legacy_weights = None if use_profile else _occurrence_weights(program)
     spilled: set[int] = set()
     history: list[tuple[int, ...]] = []
+    cost_history: list[dict[int, int]] = []
     budget_hit = False
 
     for iteration in range(program.var_count() + 1):
         history.append(tuple(sorted(spilled)))
         vp = build_virtual_program(program, spilled)
+        # Liveness and the spill form were just rebuilt from scratch, so the
+        # frequency-aware costs never go stale and cannot keep selecting a
+        # variable that was already spilled.
+        if use_profile:
+            costs = spill_costs(program, vp, block_freq, edge_freq)
+        else:
+            costs = legacy_weights
+        cost_history.append(dict(costs))
 
         clash = _precolor_conflicts(vp)
         if clash is not None:
@@ -657,7 +778,7 @@ def allocate(program: Program, k: int) -> Allocation:
                 f"with spilled vars {sorted(spilled)}; feasibility unknown"
             )
 
-        victim = _spill_victim(vp, program, weights)
+        victim = _spill_victim(vp, program, costs, profile=use_profile, k=k)
         spilled.add(victim)
     else:  # pragma: no cover
         raise RegAllocError("internal: spill iteration did not converge")
@@ -668,8 +789,10 @@ def allocate(program: Program, k: int) -> Allocation:
 
     # imported here to avoid a module cycle at import time
     from .lower import lower_program
+    from .profile import memory_traffic
 
     allocated_program = lower_program(program, vp, color)
+    traffic = memory_traffic(program, allocated_program, block_freq, edge_freq)
 
     allocation = Allocation(
         program=program,
@@ -680,6 +803,10 @@ def allocate(program: Program, k: int) -> Allocation:
         liveness=liveness_with_phis(program),
         iterations=iteration + 1,
         history=tuple(history),
+        frequencies=block_freq,
+        edge_frequencies=dict(sorted(edge_freq.items())) if edge_freq is not None else None,
+        cost_history=tuple(cost_history) if use_profile else (),
+        memory=traffic,
     )
     _post_validate(allocation, vp, color)
     return allocation
