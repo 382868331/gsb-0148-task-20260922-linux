@@ -25,6 +25,7 @@ from __future__ import annotations
 from dataclasses import dataclass, field
 
 from .liveness import liveness_with_phis, predecessors
+from .cost import AccessStats, VarSpillCost, actual_access_stats, spill_cost_table
 from .model import (
     MAX_K,
     MIN_K,
@@ -550,6 +551,64 @@ def _spill_victim(vp: VirtualProgram, program: Program, weights: dict[int, int])
     return max(candidates, key=score)
 
 
+def _frequency_spill_victim(
+    vp: VirtualProgram,
+    costs: dict[int, VarSpillCost],
+) -> int:
+    """Frequency-aware spill choice (used when block frequencies are given).
+
+    Candidates are compared lexicographically:
+
+    1. *conflict relief first* — ``degree + 1`` descending, exactly as in the
+       original policy's numerator.  Spilling must actually break the current
+       uncolorable clique; a cheap but isolated variable is not picked ahead
+       of a high-degree one.
+    2. *then predicted weighted memory cost* ascending.  Among candidates that
+       relieve the same amount of interference ("same conflict conditions"),
+       the one whose real use/def/edge-phi traffic lands in colder blocks is
+       spilled.
+    3. *variable id ascending* as the final deterministic tie break.
+
+    Temporary reload/store nodes, fixed/clobber pseudo nodes and variables
+    already spilled are not candidates.  Liveness, the graph and the cost
+    table are rebuilt after every rewrite, so a victim that did not resolve
+    the pressure is never re-scored against a stale graph.
+    """
+    candidates = sorted(vp.real_nodes)
+    if not candidates:
+        raise InfeasibleProgramError(
+            "no variables remain to spill but the coloring constraints are "
+            "unsatisfiable: proven no allocation exists"
+        )
+
+    def key(v: int) -> tuple[int, int, int]:
+        return (
+            -(len(vp.adj[v]) + 1),
+            costs.get(v, VarSpillCost()).weighted_total,
+            v,
+        )
+
+    return min(candidates, key=key)
+
+
+@dataclass(frozen=True)
+class SpillDecision:
+    """One recorded spill-rewrite decision.
+
+    ``mode`` is ``"loop-depth"`` (original heuristic, used when no
+    frequencies are supplied) or ``"frequency"`` (weighted memory-cost
+    heuristic).  ``weighted_cost`` is the predicted cost under the frequency
+    mode (``None`` otherwise); ``heuristic_score`` carries the original
+    ``(degree+1)/use-weight`` value in loop-depth mode.
+    """
+
+    iteration: int
+    victim: int
+    mode: str
+    weighted_cost: int | None
+    heuristic_score: float | None
+
+
 # --------------------------------------------------------------------------
 # public entry point
 # --------------------------------------------------------------------------
@@ -564,6 +623,9 @@ class Allocation:
     liveness: "object"
     iterations: int
     history: tuple[tuple[int, ...], ...]
+    frequencies: tuple[int, ...] | None = None
+    spill_decisions: tuple[SpillDecision, ...] = ()
+    access_stats: AccessStats | None = None
 
 
 def allocate(program: Program, k: int) -> Allocation:
@@ -615,14 +677,29 @@ def allocate(program: Program, k: int) -> Allocation:
                     f"outputs at once but K={k} (proven infeasible)"
                 )
 
+    # Spill heuristic mode:
+    #   * no block frequencies supplied -> the original
+    #     (degree+1)/loop-weighted-use policy, bit-for-bit unchanged;
+    #   * frequencies supplied          -> prefer the variable whose
+    #     predicted weighted reload/store traffic is cheapest (ties: var id).
+    use_frequency_mode = program.frequencies is not None
     weights = _occurrence_weights(program)
     spilled: set[int] = set()
     history: list[tuple[int, ...]] = []
+    decisions: list[SpillDecision] = []
     budget_hit = False
 
     for iteration in range(program.var_count() + 1):
         history.append(tuple(sorted(spilled)))
+        # liveness, the spill form and (in frequency mode) the cost table are
+        # rebuilt from scratch on every round, so a rewrite that changed
+        # liveness is never scored against a stale graph.
         vp = build_virtual_program(program, spilled)
+        cost_table = (
+            spill_cost_table(program, program.frequencies)
+            if use_frequency_mode
+            else None
+        )
 
         clash = _precolor_conflicts(vp)
         if clash is not None:
@@ -652,12 +729,36 @@ def allocate(program: Program, k: int) -> Allocation:
             break
 
         if budget_hit:
+            # Explicit termination: feasibility unknown, nothing is returned
+            # as if it were an allocation.
             raise BudgetExhaustedError(
                 f"exact coloring search budget exhausted at iteration {iteration + 1} "
                 f"with spilled vars {sorted(spilled)}; feasibility unknown"
             )
 
-        victim = _spill_victim(vp, program, weights)
+        if use_frequency_mode:
+            victim = _frequency_spill_victim(vp, cost_table)
+            decisions.append(
+                SpillDecision(
+                    iteration=iteration + 1,
+                    victim=victim,
+                    mode="frequency",
+                    weighted_cost=cost_table.get(victim, VarSpillCost()).weighted_total,
+                    heuristic_score=None,
+                )
+            )
+        else:
+            victim = _spill_victim(vp, program, weights)
+            w = weights.get(victim, 1)
+            decisions.append(
+                SpillDecision(
+                    iteration=iteration + 1,
+                    victim=victim,
+                    mode="loop-depth",
+                    weighted_cost=None,
+                    heuristic_score=(len(vp.adj[victim]) + 1) / w,
+                )
+            )
         spilled.add(victim)
     else:  # pragma: no cover
         raise RegAllocError("internal: spill iteration did not converge")
@@ -680,7 +781,14 @@ def allocate(program: Program, k: int) -> Allocation:
         liveness=liveness_with_phis(program),
         iterations=iteration + 1,
         history=tuple(history),
+        frequencies=program.frequencies,
+        spill_decisions=tuple(decisions),
     )
+    # Ground-truth traffic: count the load/store instructions that actually
+    # ended up in the lowered program (with frequencies, weighted by the
+    # lowered block's execution frequency).  This is deliberately separate
+    # from the heuristic table used to make decisions.
+    allocation.access_stats = actual_access_stats(program, allocation)
     _post_validate(allocation, vp, color)
     return allocation
 

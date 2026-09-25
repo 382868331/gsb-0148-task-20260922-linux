@@ -3,10 +3,14 @@
 Public surface::
 
     allocate(program, K) -> Allocation
-    Program / Block / Instr dataclasses
+    Program / Block / Instr dataclasses (Program accepts per-block
+    non-negative integer ``frequencies``; omit them to keep the original
+    loop-depth-weighted spill policy)
     program_from_dict(...)
     exception hierarchy: RegAllocError, ProgramFormatError,
                           InfeasibleProgramError, BudgetExhaustedError
+    cost accounting: AccessStats, VarSpillCost, spill_cost_table,
+                     actual_access_stats
 """
 
 from .model import (
@@ -21,13 +25,21 @@ from .allocator import (
     ProgramFormatError,
     InfeasibleProgramError,
     BudgetExhaustedError,
+    SpillDecision,
     allocate,
 )
 from .liveness import LivenessReport
+from .cost import (
+    AccessStats,
+    VarSpillCost,
+    actual_access_stats,
+    spill_cost_table,
+)
 
 __all__ = [
     "allocate",
     "Allocation",
+    "SpillDecision",
     "LivenessReport",
     "Program",
     "Block",
@@ -37,4 +49,8 @@ __all__ = [
     "ProgramFormatError",
     "InfeasibleProgramError",
     "BudgetExhaustedError",
+    "AccessStats",
+    "VarSpillCost",
+    "actual_access_stats",
+    "spill_cost_table",
 ]

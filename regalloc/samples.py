@@ -11,6 +11,13 @@ import random
 
 from .model import Block, Instr, PhiNode, Program
 
+# Execution-frequency hints used by the hot/cold fixture.  The hot loop is
+# expected to run HOT_FREQ times per entry; the cold error-recovery block is
+# expected never to run on the common path (0).  The inverted profile swaps
+# the two.  These are heuristic hints, not semantic facts.
+HOT_FREQ = 100
+COLD_RECOVERY_USES = 12
+
 
 def sample_call_surviving() -> Program:
     """A value is live across a call that clobbers r0 and r1.
@@ -85,6 +92,96 @@ def sample_fixed_collision() -> Program:
         succs=(),
     )
     return Program(blocks=(b0,), params=(0, 1), name="fixed-collision")
+
+
+def sample_hot_cold_loop(*, inverted: bool = False) -> Program:
+    """Hot loop with a cold error-recovery block inside the natural loop.
+
+    Layout (all variable ids are dense on purpose)::
+
+        b0 entry:  v1 = const (hot loop invariant)
+                   v2 = const (cold error-recovery value)
+                   v3 = const (hot loop invariant)
+        b1 header: phi v4 <- v3 (entry) | v19 (cold recovery) | v7 (latch)
+        b2 body:   v5 = f(v1, v4); v6 = g(v5, v3)      ; the hot work
+                   -> b3 (cold recovery) or b4 (latch)
+        b3 cold:   a chain of COLD_RECOVERY_USES references to v2
+                   (v8..v19), then jumps back to the header
+        b4 latch:  v7 = f(v6) -> header or exit
+        b5 exit:   sink(v6)
+
+    The cold recovery block is structurally *inside* the natural loop (it has
+    a back edge to the header), so the original loop-depth heuristic counts
+    its many static references to v2 with the full x10 loop weight and
+    wrongly concludes v2 is a hot, must-keep value.  Block *frequency* hints
+    carry the information loop nesting cannot: with the normal profile the
+    recovery block never executes on the common path (frequency 0), while
+    with ``inverted=True`` it is the hot block and the loop body is cold.
+
+    At K=3 register pressure forces two spills among the live-across-loop
+    values; the two profiles therefore make opposite, checkable choices.
+    """
+    n = COLD_RECOVERY_USES
+    b0 = Block(
+        label="entry",
+        instrs=(
+            Instr(uid=0, uses=(0,), defs=(1,), note="hot loop invariant v1 = f(v0)"),
+            Instr(uid=1, uses=(), defs=(2,), note="cold error value v2"),
+            Instr(uid=2, uses=(), defs=(3,), note="hot loop invariant v3"),
+        ),
+        succs=(1,),
+    )
+    b1 = Block(
+        label="loop_header",
+        instrs=(),
+        succs=(2,),
+        phis=(PhiNode(def_var=4, sources=((0, 3), (3, 7 + n), (4, 7))),),
+    )
+    b2 = Block(
+        label="hot_body",
+        instrs=(
+            Instr(uid=3, uses=(1, 4), defs=(5,), note="hot v5 = f(v1, v4)"),
+            Instr(uid=4, uses=(5, 3), defs=(6,), note="hot v6 = g(v5, v3)"),
+        ),
+        succs=(3, 4),
+    )
+    # cold recovery chain inside the loop: uid 5 uses v2 -> v8, then uids
+    # 6..(4+n) each re-read v2 while threading v8..v(7+n); the last value
+    # v(7+n) feeds the header phi on the recovery back edge
+    cold = [Instr(uid=5, uses=(2,), defs=(8,), note="cold recovery start (uses v2)")]
+    for i in range(1, n):
+        cold.append(
+            Instr(
+                uid=5 + i,
+                uses=(2, 7 + i),
+                defs=(8 + i,),
+                note=f"cold recovery {i} (re-reads v2)",
+            )
+        )
+    b3 = Block(label="cold_recovery", instrs=tuple(cold), succs=(1,))
+    b4 = Block(
+        label="latch",
+        instrs=(Instr(uid=5 + n, uses=(6,), defs=(7,), note="v7 = f(v6)"),),
+        succs=(1, 5),
+    )
+    b5 = Block(
+        label="exit",
+        instrs=(Instr(uid=6 + n, uses=(6,), defs=(), note="sink v6"),),
+        succs=(),
+    )
+    h = HOT_FREQ
+    if inverted:
+        frequencies = (1, 0, 0, h, 0, 1)
+        name = "hot-cold-loop-inverted"
+    else:
+        frequencies = (1, h, h, 0, h, 1)
+        name = "hot-loop-cold-recovery"
+    return Program(
+        blocks=(b0, b1, b2, b3, b4, b5),
+        params=(0,),
+        name=name,
+        frequencies=frequencies,
+    )
 
 
 def sample_register_pressure() -> Program:

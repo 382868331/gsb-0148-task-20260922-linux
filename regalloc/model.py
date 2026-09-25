@@ -224,6 +224,18 @@ class Program:
     blocks: tuple[Block, ...]
     params: tuple[int, ...] = ()
     name: str = ""
+    frequencies: tuple[int, ...] | None = None
+    """Per-block *execution frequency hints* (non-negative ints).
+
+    ``None`` (the default) means "not provided": the allocator keeps its
+    original loop-depth-weighted spill heuristic.  When provided, the value
+    at index ``i`` says how often block ``i`` is expected to execute relative
+    to one entry of the program (e.g. a hot loop body gets a large value, a
+    cold error-handling block gets 0).  The numbers influence the spill
+    heuristic only; they never change program semantics, validity, or the
+    set of legal allocations.  Edge actions (phi copies / spill traffic on a
+    CFG edge) are weighted by the *predecessor* block frequency.
+    """
 
     def __post_init__(self) -> None:
         if not isinstance(self.blocks, (list, tuple)) or not self.blocks:
@@ -245,6 +257,23 @@ class Program:
             for s in b.succs:
                 if s >= n:
                     raise _err(f"blocks[{i}].succs", f"successor {s} out of range (0..{n - 1})")
+
+        frequencies = self.frequencies
+        if frequencies is not None:
+            if not isinstance(frequencies, (list, tuple)):
+                raise _err(
+                    "frequencies",
+                    f"expected a list/tuple of {n} non-negative ints or None",
+                )
+            if len(frequencies) != n:
+                raise _err(
+                    "frequencies",
+                    f"expected one frequency per block ({n}), got {len(frequencies)}",
+                )
+            norm_freq: list[int] = []
+            for i, value in enumerate(frequencies):
+                norm_freq.append(check_int(value, f"frequencies[{i}]", minimum=0))
+            frequencies = tuple(norm_freq)
 
         preds: list[set[int]] = [set() for _ in range(n)]
         for i, b in enumerate(blocks):
@@ -317,6 +346,8 @@ class Program:
 
         object.__setattr__(self, "blocks", blocks)
         object.__setattr__(self, "params", params)
+        if self.frequencies is not None:
+            object.__setattr__(self, "frequencies", frequencies)
 
     def var_count(self) -> int:
         """One past the largest variable id used (ids may be sparse)."""
@@ -346,6 +377,7 @@ def program_from_dict(data: Any) -> Program:
     Expected shape::
 
         {"name": str?, "params": [int]?,
+         "frequencies": [int]?,   # one non-negative int per block; omit for None
          "blocks": [{"label": str?,
                      "instrs": [{"uid": int, "uses": [int], "defs": [int],
                                  "fixed": {"0": 1}, "clobbers": [int],
@@ -416,8 +448,16 @@ def program_from_dict(data: Any) -> Program:
             )
         )
     params = tuple(data.get("params", ()))
+    frequencies = data.get("frequencies")
+    if frequencies is not None:
+        frequencies = tuple(frequencies)
     try:
-        return Program(blocks=tuple(blocks), params=params, name=str(data.get("name", "")))
+        return Program(
+            blocks=tuple(blocks),
+            params=params,
+            name=str(data.get("name", "")),
+            frequencies=frequencies,
+        )
     except ProgramFormatError as exc:
         # make instr-level paths locatable when constructed from raw blocks
         raise exc
