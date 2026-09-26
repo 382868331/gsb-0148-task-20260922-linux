@@ -151,6 +151,50 @@ def sample_loop_call() -> Program:
     return Program(blocks=(b0, b1, b2), params=(0,), name="loop-call")
 
 
+def sample_branch_stack_reuse() -> Program:
+    """Branch-local spill values alias; a merge-surviving value cannot.
+
+    At K=2, the two call clobbers force the left/right branch source values
+    v3 and v6 to memory.  They are live on mutually exclusive predecessor
+    edges, so one stack interval serves both.  Parameter v0 is still needed
+    after the merge, so it keeps a separate interval; the minimum frame for
+    eight-byte slots is therefore 16 bytes, not 24.
+    """
+    b0 = Block(
+        label="entry",
+        instrs=(Instr(uid=0, uses=(1,), defs=(2,), note="prepare branch input"),),
+        succs=(1, 2),
+    )
+    b1 = Block(
+        label="left",
+        instrs=(
+            Instr(uid=1, uses=(), defs=(3,), note="left source"),
+            Instr(uid=2, uses=(), defs=(4,), clobbers=(0, 1), note="left call"),
+            Instr(uid=3, uses=(4, 3), defs=(5,), note="left phi source"),
+        ),
+        succs=(3,),
+    )
+    b2 = Block(
+        label="right",
+        instrs=(
+            Instr(uid=4, uses=(), defs=(6,), note="right source"),
+            Instr(uid=5, uses=(), defs=(7,), clobbers=(0, 1), note="right call"),
+            Instr(uid=6, uses=(7, 6), defs=(8,), note="right phi source"),
+        ),
+        succs=(3,),
+    )
+    b3 = Block(
+        label="merge",
+        instrs=(
+            Instr(uid=7, uses=(9, 0), defs=(10,), note="merge uses phi and survivor"),
+            Instr(uid=8, uses=(10,), defs=(), note="sink"),
+        ),
+        succs=(),
+        phis=(PhiNode(def_var=9, sources=((1, 5), (2, 8))),),
+    )
+    return Program(blocks=(b0, b1, b2, b3), params=(0, 1), name="branch-stack-reuse")
+
+
 def generate_pressure_program(seed: int = 20260922, *, width: int = 5,
                               clobber: bool = True) -> Program:
     """Deterministically generated straight-line pressure program.

@@ -564,9 +564,19 @@ class Allocation:
     liveness: "object"
     iterations: int
     history: tuple[tuple[int, ...], ...]
+    stack_layout: object = None
 
 
-def allocate(program: Program, k: int) -> Allocation:
+def allocate(
+    program: Program,
+    k: int,
+    *,
+    pack_stack: bool = False,
+    slot_size: int = 8,
+    slot_alignment: int = 8,
+    frame_alignment: int | None = None,
+    stack_budget: int = 10_000,
+) -> Allocation:
     """Allocate ``program`` to ``k`` physical registers.
 
     Raises:
@@ -682,6 +692,16 @@ def allocate(program: Program, k: int) -> Allocation:
         history=tuple(history),
     )
     _post_validate(allocation, vp, color)
+    if pack_stack:
+        from .stack import layout_stack_slots
+
+        layout_stack_slots(
+            allocation,
+            sizes=slot_size,
+            alignments=slot_alignment,
+            frame_alignment=frame_alignment,
+            budget=stack_budget,
+        )
     return allocation
 
 

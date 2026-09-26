@@ -40,6 +40,7 @@ class MI:
     clobbers: tuple[int, ...] = ()
     uid: int = -1
     note: str = ""
+    offset: int = -1
 
     def render(self) -> str:
         if self.kind == "op":
@@ -51,9 +52,11 @@ class MI:
         if self.kind == "copy":
             return f"copy r{self.dst} <- r{self.src}"
         if self.kind == "load":
-            return f"load r{self.dst} <- slot{self.slot}"
+            at = f" [sp+{self.offset}]" if self.offset >= 0 else ""
+            return f"load r{self.dst} <- slot{self.slot}{at}"
         if self.kind == "store":
-            return f"store slot{self.slot} <- r{self.src}"
+            at = f" [sp+{self.offset}]" if self.offset >= 0 else ""
+            return f"store slot{self.slot}{at} <- r{self.src}"
         raise AssertionError(self.kind)
 
 
