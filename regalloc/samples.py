@@ -151,6 +151,96 @@ def sample_loop_call() -> Program:
     return Program(blocks=(b0, b1, b2), params=(0,), name="loop-call")
 
 
+def sample_branch_slot_reuse() -> Program:
+    """Contrast fixture for stack-slot packing.
+
+    Two mutually exclusive branches each spill branch-private values whose
+    lifetimes never overlap; after lowering they may share one physical stack
+    offset.  Two values (v1, v2) are defined before the branch and stay live
+    through both arms up to the join: they cannot share with anyone that
+    overlaps them, and values arriving at the join (phis v11, v12) cannot
+    reuse slots of values that are still live across the join.
+
+    ::
+
+        entry: v1, v2 -> left | right
+        left:  v3,v4 private; v5=f(v3,v1); v6=f(v4,v2)
+        right: v7,v8 private; v9=f(v7,v1); v10=f(v8,v2)
+        join:  phi v11 <- v5|v9 ; phi v12 <- v6|v10
+               v13=f(v11,v12); sink(v13,v0)
+    """
+    b0 = Block(
+        label="entry",
+        instrs=(
+            Instr(uid=0, uses=(), defs=(1,), note="v1"),
+            Instr(uid=1, uses=(), defs=(2,), note="v2"),
+        ),
+        succs=(1, 2),
+    )
+    b1 = Block(
+        label="left",
+        instrs=(
+            Instr(uid=2, uses=(), defs=(3,), note="v3 private"),
+            Instr(uid=3, uses=(), defs=(4,), note="v4 private"),
+            Instr(uid=4, uses=(3, 1), defs=(5,), note="v5=f(v3,v1)"),
+            Instr(uid=5, uses=(4, 2), defs=(6,), note="v6=f(v4,v2)"),
+        ),
+        succs=(3,),
+    )
+    b2 = Block(
+        label="right",
+        instrs=(
+            Instr(uid=6, uses=(), defs=(7,), note="v7 private"),
+            Instr(uid=7, uses=(), defs=(8,), note="v8 private"),
+            Instr(uid=8, uses=(7, 1), defs=(9,), note="v9=f(v7,v1)"),
+            Instr(uid=9, uses=(8, 2), defs=(10,), note="v10=f(v8,v2)"),
+        ),
+        succs=(3,),
+    )
+    b3 = Block(
+        label="join",
+        instrs=(
+            Instr(uid=10, uses=(11, 12), defs=(13,), note="join use"),
+            Instr(uid=11, uses=(13, 0), defs=(), note="sink"),
+        ),
+        succs=(),
+        phis=(
+            PhiNode(def_var=11, sources=((1, 5), (2, 9))),
+            PhiNode(def_var=12, sources=((1, 6), (2, 10))),
+        ),
+    )
+    return Program(blocks=(b0, b1, b2, b3), params=(0,), name="branch-slot-reuse")
+
+
+def sample_spilled_across_call() -> Program:
+    """Several values are live across a call and one must be spilled.
+
+    The spilled value survives the call *in memory*: the frame slot must not
+    be reused by anything else until the value is consumed afterwards, but a
+    dead slot may legally be reused across the call itself (calls clobber
+    registers, not stack slots).
+
+    ::
+
+        v1..v4 defined; call clobbers r0,r1 while v1..v4 survive;
+        v5=f(v1,v2); v6=f(v3,v4); sink(v5,v6)
+    """
+    b0 = Block(
+        label="entry",
+        instrs=(
+            Instr(uid=0, uses=(), defs=(1,), note="v1"),
+            Instr(uid=1, uses=(), defs=(2,), note="v2"),
+            Instr(uid=2, uses=(), defs=(3,), note="v3"),
+            Instr(uid=3, uses=(), defs=(4,), note="v4"),
+            Instr(uid=4, uses=(1, 2), defs=(5,), clobbers=(0, 1), note="call(v1,v2)"),
+            Instr(uid=5, uses=(3, 4), defs=(6,), note="v6=f(v3,v4)"),
+            Instr(uid=6, uses=(5, 6), defs=(), note="sink"),
+        ),
+        succs=(),
+    )
+    return Program(blocks=(b0,), params=(), name="spilled-across-call")
+
+
 def generate_pressure_program(seed: int = 20260922, *, width: int = 5,
                               clobber: bool = True) -> Program:
     """Deterministically generated straight-line pressure program.

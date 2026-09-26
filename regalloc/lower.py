@@ -40,6 +40,7 @@ class MI:
     clobbers: tuple[int, ...] = ()
     uid: int = -1
     note: str = ""
+    offset: int = -1       # final frame byte offset of the addressed slot
 
     def render(self) -> str:
         if self.kind == "op":
@@ -51,9 +52,11 @@ class MI:
         if self.kind == "copy":
             return f"copy r{self.dst} <- r{self.src}"
         if self.kind == "load":
-            return f"load r{self.dst} <- slot{self.slot}"
+            where = f"slot{self.slot}[fp{self.offset:+d}]" if self.offset >= 0 else f"slot{self.slot}"
+            return f"load r{self.dst} <- {where}"
         if self.kind == "store":
-            return f"store slot{self.slot} <- r{self.src}"
+            where = f"slot{self.slot}[fp{self.offset:+d}]" if self.offset >= 0 else f"slot{self.slot}"
+            return f"store {where} <- r{self.src}"
         raise AssertionError(self.kind)
 
 
@@ -74,6 +77,7 @@ class AllocatedProgram:
     assignment: dict[int, int]
     scratch_slot: int
     param_regs: dict[int, int]
+    frame: object = None     # StackLayout once slot packing has run
 
     def render(self) -> str:
         lines: list[str] = []
@@ -220,3 +224,23 @@ def lower_program(program: Program, vp: VirtualProgram, color: dict[int, int]) -
 
 def _k_from_color(color: dict[int, int]) -> int:
     return max(color.values()) + 1 if color else 0
+
+
+def apply_frame_layout(allocated_program: AllocatedProgram, layout) -> AllocatedProgram:
+    """Annotate every load/store with its final frame byte offset.
+
+    The register-level code and the register assignment are untouched; only
+    the memory addressing metadata changes.  The same (mutable)
+    AllocatedProgram is returned for convenience.
+    """
+    for b in allocated_program.blocks:
+        for j, mi in enumerate(b.instrs):
+            if mi.kind in ("load", "store"):
+                off = layout.slot_offsets[mi.slot]
+                b.instrs[j] = MI(
+                    kind=mi.kind, dst=mi.dst, src=mi.src, slot=mi.slot,
+                    reads=mi.reads, writes=mi.writes, clobbers=mi.clobbers,
+                    uid=mi.uid, note=mi.note, offset=off,
+                )
+    allocated_program.frame = layout
+    return allocated_program

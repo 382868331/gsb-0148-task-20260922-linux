@@ -16,11 +16,18 @@
 ## 准确命令
 
 ```bash
+# 准备（可选；仓库自带 .venv 软链，Linux 原生 Python 3.14.7）
+python3.14 -m venv .venv
+# source .venv/bin/activate
+
 # 运行必要测试
 python -m unittest discover -s tests -v
 
 # 运行固定输入演示（真实计算；本机约 0.05 秒，远小于 8 秒预算）
 python demo.py
+
+# 运行本轮栈槽布局演示（真实计算；本机 < 1 秒，预算 90 秒）
+python demo_iteration.py
 ```
 
 ## 公开接口与数据结构
@@ -125,9 +132,64 @@ alloc = allocate(program, K)        # K 为 2..8 的 int（拒绝 bool / float�
      插入一个单后继的拆分块（自环临界边同样处理）。
    - 每条边的寄存器/槽并行赋值用经典算法顺序化（先发射“目标不再被需要”的
      动作；剩下的纯寄存器置换环用一个专用内存 scratch 槽打断），
-     **不占用额外寄存器**，故对 K=2 也成立。
+    **不占用额外寄存器**，故对 K=2 也成立。
 
 6. **不追求最少 spill**：启发式确定性、可解释；正确性优先。
+
+## 栈槽布局（本轮新增，默认关闭的独立开关）
+
+寄存器分配结束后每个 spill 值只拥有一个**逻辑槽号**（仍为变量 id）。
+调用 ``allocate(program, K, pack_slots=True, ...)`` 时追加一个**后置**
+栈槽布局阶段（`stack_layout.py`），它**不改变**寄存器分配结果与发射的
+spill 代码，只在“插入溢出指令之后”重算活跃性并给出最终帧偏移：
+
+1. **在 lower 后的无 phi 机器 CFG 上重算槽位活跃性**：phi 的读写在
+   `lower.py` 中已经落到对应前驱边（前驱唯一后继时追加到前驱尾部，
+   否则进入临界边拆分块），因此槽位活跃性只是普通的反向数据流
+   （`store` 定义/杀死槽，`load` 使用槽），phi 不会被当成块内普通指令；
+   栈传递参数（被 spill 的入口参数）从入口块 live-in 起就位于自己的槽。
+2. **槽冲突图**：任一机器指令点 live-before 的槽两两冲突；`store` 的目标
+   携带新值并与所有跨越该点存活的值相邻，写点共存由该保守团覆盖。
+3. **调用方给定大小/对齐**：`slot_size` / `slot_alignment` /
+   `frame_alignment` 必须是正整数（拒 bool），且
+   `slot_alignment <= slot_size`、`frame_alignment` 是 `slot_alignment` 的整数倍。
+   重叠活跃值占用的**字节区间**严格分开（任意偏移候选都按半开区间判重叠）。
+   用于打破寄存器置换环的 scratch 槽同样进帧布局。
+4. **小规模精确枚举**：按 (大小, 冲突度, id) 排序后 DFS 枚举每个槽的合法
+   对齐偏移，求**最小帧大小**（末尾向上取整到帧对齐）。`layout_budget`
+   （默认 200,000 次候选放置）耗尽时返回确定性贪心得到的**合法布局**，
+   `proven_optimal=False`，并在 `note` 中注明“未证最优”。
+5. **跨 call 活跃值不会丢失**：call 只破坏寄存器、不破坏内存；槽复用与否
+   完全由 lower 后重算的活跃性决定——仍需使用的槽在 call 点与任何新值冲突，
+   已死槽则允许跨 call 复用。
+
+接口约定::
+
+    alloc = allocate(program, K, pack_slots=True,
+                     slot_size=8, slot_alignment=8,
+                     frame_alignment=16, layout_budget=200_000)
+    alloc.stack_layout      # StackLayout | None（开关关闭时为 None）
+    alloc.slot_liveness     # lower 后 CFG 的槽活跃性 SlotLiveness
+
+`StackLayout` 字段：`slot_offsets`（逻辑槽 -> 最终帧字节偏移）、
+`slot_sizes` / `slot_alignments`、`frame_size`、`frame_alignment`、
+`scratch_slot` / `scratch_offset`、`proven_optimal`、`budget` /
+`budget_spent`、`note`。布局后每条 `load` / `store` 机器指令携带
+`mi.offset`（其实际访存偏移），`render()` 打印为 `slotN[fp+off]`；
+开关关闭时 `mi.offset == -1`、`allocated_program.frame is None`。
+`allocation.slots` 与寄存器 `assignment` 不受开关影响（测试逐条断言）。
+
+独立对照用例（`tests/test_stack_layout.py`，期望值手算/独立重推）：
+
+- `sample_branch_slot_reuse()`：两条**互斥分支**各自的私有 spill 槽在不同
+  CFG 边上存活，可共享同一偏移；而跨分支、在**汇合点**仍活跃的值
+  （及汇合后产生的值）与重叠的私有槽冲突，不能共享；phi 源经边动作
+  （含临界边拆分）验证；
+- 小规模槽布局枚举核对最小帧（直线压力例程峰值 5 个 8 字节槽 -> 48 字节，
+  16 字节对齐），`layout_budget=1` 时返回合法布局且 `proven_optimal=False`；
+- 混合 8/16 字节、8/16 对齐的直接阶段 API 用例，校验字节区间不重叠与偏移对齐；
+- 跨 call spill 例程 + 偏移**变异用例**（把一条 load 的偏移改成别的槽区间），
+  原符号执行器按最终字节偏移建模内存，真实访存后必须判定不等价。
 
 ## 独立验证
 
@@ -140,7 +202,9 @@ alloc = allocate(program, K)        # K 为 2..8 的 int（拒绝 bool / float�
   以及用独立的并行赋值模拟器比对顺序化后的机器指令效果。
 - 测试中的期望值均为手算/独立推导，**不通过调用被测核心得到**；
   “往返一致”只作为补充。测试还包含**变异用例**（故意删 reload / 改读寄存器 /
-  删 phi 边拷贝 / 写错栈槽），确认执行器确实有判别力。
+  删 phi 边拷贝 / 写错栈槽），确认执行器确实有判别力。开启槽布局后，执行器
+  内存以**最终字节偏移**为键（共享偏移即真实别名），故改错一条 load/store 的
+  偏移也会在真实访存后被抓到。
 
 覆盖要点：临界边 phi（含自环）、跨 call 活跃值、固定寄存器碰撞、
 寄存器不足触发 spill、预算耗尽与证明无解分离、严格输入拒绝、确定性与可复现。
@@ -164,6 +228,10 @@ alloc = allocate(program, K)        # K 为 2..8 的 int（拒绝 bool / float�
   `bound_reached`；这是**覆盖**界限而非数值容差。
 - 块数上限 40、单块指令上限 10,000 是接口边界；演示用例规模很小，
   未穷举上限规模，也不做长时压力测试。
+- 槽布局的精确偏移枚举在最坏情况下同样是指数问题；受 `layout_budget`
+  限制，超预算时只保证返回**合法布局**并明确标注“未证最优”，绝不谎报最小。
+  本轮槽大小/对齐是**全函数统一标量**参数（调用方给定），不建模变长/向量
+  宽槽或真实 ABI 的入栈参数区重排；开关只影响帧布局，不影响寄存器分配。
 
 ## 目录
 
@@ -173,8 +241,10 @@ regalloc/
   liveness.py   边敏感活跃性（含 phi / 无 phi 两种）
   allocator.py  冲突图、贪心+精确染色、迭代 spill、allocate()
   lower.py      临界边拆分、并行拷贝顺序化、寄存器/栈代码生成
+  stack_layout.py 插入溢出指令后的槽活跃性重算、槽冲突图、预算化精确帧布局
   symbolic.py   独立配对符号执行器（前后程序对照）
   samples.py    确定性示例与固定种子程序生成器
 tests/          必要测试（含独立参考 _reference.py 与变异用例）
 demo.py         固定输入演示：正常 spill 结果 + 实际触发的拒绝边界
+demo_iteration.py 本轮演示：槽共享/不可共享对照、跨 call、对齐与预算边界
 ```

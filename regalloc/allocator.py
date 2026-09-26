@@ -564,22 +564,55 @@ class Allocation:
     liveness: "object"
     iterations: int
     history: tuple[tuple[int, ...], ...]
+    stack_layout: object = None
+    slot_liveness: object = None
 
 
-def allocate(program: Program, k: int) -> Allocation:
+def allocate(
+    program: Program,
+    k: int,
+    *,
+    pack_slots: bool = False,
+    slot_size: int = 8,
+    slot_alignment: int = 8,
+    frame_alignment: int = 16,
+    layout_budget: int = 200_000,
+) -> Allocation:
     """Allocate ``program`` to ``k`` physical registers.
 
     Raises:
-        ProgramFormatError: bad program/K (K outside 2..8, bool, NaN-like).
+        ProgramFormatError: bad program/K or bad slot/frame layout arguments.
         InfeasibleProgramError: constraints proven contradictory.
         BudgetExhaustedError: coloring search budget exhausted (feasibility
             unknown).
+
+    Stack-slot packing (``pack_slots=True``) is a post-allocation stage and
+    never changes the register assignment or the emitted spill code; it only
+    recomputes liveness on the lowered program and assigns final frame byte
+    offsets.  All size/alignment arguments are caller-given positive ints
+    (bools rejected), with ``slot_alignment <= slot_size`` and the slot
+    alignment dividing the frame alignment.
     """
     if not isinstance(program, Program):
         raise ProgramFormatError("allocate: expected a Program instance")
     check_int(k, "K", minimum=MIN_K)
     if k > MAX_K:
         raise ProgramFormatError(f"K: expected integer <= {MAX_K}, got {k}")
+    check_int(slot_size, "slot_size", minimum=1)
+    check_int(slot_alignment, "slot_alignment", minimum=1)
+    check_int(frame_alignment, "frame_alignment", minimum=1)
+    check_int(layout_budget, "layout_budget", minimum=1)
+    if slot_alignment > slot_size:
+        raise ProgramFormatError(
+            f"slot_alignment: expected <= slot_size ({slot_size}), got {slot_alignment}"
+        )
+    if frame_alignment % slot_alignment != 0:
+        raise ProgramFormatError(
+            f"frame_alignment: {frame_alignment} must be a multiple of "
+            f"slot_alignment {slot_alignment}"
+        )
+    if not isinstance(pack_slots, bool):
+        raise ProgramFormatError("pack_slots: expected bool")
 
     # every fixed/clobber register must fit K
     for bi, b in enumerate(program.blocks):
@@ -671,6 +704,38 @@ def allocate(program: Program, k: int) -> Allocation:
 
     allocated_program = lower_program(program, vp, color)
 
+    stack_layout = None
+    slot_live = None
+    if pack_slots:
+        # Post-spill liveness is recomputed on the *lowered* phi-free CFG:
+        # phi reads/writes already live on their predecessor edges (tail or
+        # split blocks), so edge semantics are preserved by construction.
+        from .lower import apply_frame_layout
+        from .stack_layout import (
+            build_slot_interference,
+            pack_slots as pack_stage,
+            slot_liveness as compute_slot_liveness,
+        )
+
+        spilled_params = [v for v in program.params if v in spilled]
+        slot_live = compute_slot_liveness(allocated_program, spilled_params)
+        slot_conflicts = build_slot_interference(slot_live)
+        # The scratch slot always occupies frame space (used only when a
+        # register-permutation cycle has to be broken on an edge).
+        logical_slots = sorted(spilled) + [allocated_program.scratch_slot]
+        sizes = {v: slot_size for v in logical_slots}
+        aligns = {v: slot_alignment for v in logical_slots}
+        stack_layout = pack_stage(
+            logical_slots=logical_slots,
+            scratch_slot=allocated_program.scratch_slot,
+            conflicts=slot_conflicts,
+            sizes=sizes,
+            aligns=aligns,
+            frame_alignment=frame_alignment,
+            budget=layout_budget,
+        )
+        apply_frame_layout(allocated_program, stack_layout)
+
     allocation = Allocation(
         program=program,
         k=k,
@@ -680,6 +745,8 @@ def allocate(program: Program, k: int) -> Allocation:
         liveness=liveness_with_phis(program),
         iterations=iteration + 1,
         history=tuple(history),
+        stack_layout=stack_layout,
+        slot_liveness=slot_live,
     )
     _post_validate(allocation, vp, color)
     return allocation

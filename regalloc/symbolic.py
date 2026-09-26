@@ -75,6 +75,7 @@ def equivalence_check(
     spilled = set(allocation.slots)
     k = allocation.k
     report = liveness_with_phis(program)
+    frame = getattr(allocation.allocated_program, "frame", None)
 
     n = len(program.blocks)
     orig_to_ab: dict[int, int] = {}
@@ -89,22 +90,31 @@ def equivalence_check(
 
     def loc_for_var(v: int, regs: dict[int, Any], slots: dict[int, Any]):
         if v in spilled:
-            return slots.get(v, UNINITIALIZED)
+            return slots.get(slot_address(v), UNINITIALIZED)
         if v not in colors:
             return UNINITIALIZED
         return regs.get(colors[v], UNINITIALIZED)
+
+    # When frame packing ran, memory is addressed by *byte offset*: two
+    # logical slots sharing an offset genuinely alias, so a wrong overlap
+    # decision manifests as a corrupted token on the real executed path.
+    def slot_address(slot_id: int, mi_offset: int = -1):
+        if frame is not None:
+            off = mi_offset if mi_offset >= 0 else frame.slot_offsets[slot_id]
+            return ("mem", off)
+        return ("slot", slot_id)
 
     def run_path(edge_seq: list[int]) -> str | None:
         """Execute one paired path.  ``edge_seq`` is the list of successors
         taken from the entry; the path ends in an exit (no successors)."""
         env: dict[int, Any] = {v: ("param", v) for v in program.params}
         regs: dict[int, Any] = {r: UNINITIALIZED for r in range(k)}
-        slots: dict[int, Any] = {}
+        slots: dict[Any, Any] = {}
         # register-passed parameters start in their home register;
         # stack-passed (spilled) parameters are born in their spill slot
         for v in program.params:
             if v in spilled:
-                slots[v] = ("param", v)
+                slots[slot_address(v)] = ("param", v)
             else:
                 regs[colors[v]] = ("param", v)
 
@@ -130,9 +140,9 @@ def equivalence_check(
                 if mi.kind == "copy":
                     regs[mi.dst] = regs[mi.src]
                 elif mi.kind == "load":
-                    regs[mi.dst] = slots.get(mi.slot, UNINITIALIZED)
+                    regs[mi.dst] = slots.get(slot_address(mi.slot, mi.offset), UNINITIALIZED)
                 elif mi.kind == "store":
-                    slots[mi.slot] = regs[mi.src]
+                    slots[slot_address(mi.slot, mi.offset)] = regs[mi.src]
                 elif mi.kind == "op":
                     ins = sb.instrs[src_i]
                     if mi.uid != ins.uid:
@@ -182,9 +192,9 @@ def equivalence_check(
                 if mi.kind == "copy":
                     regs[mi.dst] = regs[mi.src]
                 elif mi.kind == "load":
-                    regs[mi.dst] = slots.get(mi.slot, UNINITIALIZED)
+                    regs[mi.dst] = slots.get(slot_address(mi.slot, mi.offset), UNINITIALIZED)
                 elif mi.kind == "store":
-                    slots[mi.slot] = regs[mi.src]
+                    slots[slot_address(mi.slot, mi.offset)] = regs[mi.src]
 
             # 2) follow the successor chain (possibly through split blocks)
             t = acur
@@ -203,9 +213,9 @@ def equivalence_check(
                     if mi.kind == "copy":
                         regs[mi.dst] = regs[mi.src]
                     elif mi.kind == "load":
-                        regs[mi.dst] = slots.get(mi.slot, UNINITIALIZED)
+                        regs[mi.dst] = slots.get(slot_address(mi.slot, mi.offset), UNINITIALIZED)
                     elif mi.kind == "store":
-                        slots[mi.slot] = regs[mi.src]
+                        slots[slot_address(mi.slot, mi.offset)] = regs[mi.src]
             acur = target
 
             # 3) edge-sensitive live values must be in their home locations.

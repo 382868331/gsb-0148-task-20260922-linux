@@ -25,10 +25,16 @@ from .allocator import (
 )
 from .liveness import LivenessReport
 
+from .stack_layout import StackLayout, SlotLiveness, pack_slots, slot_liveness
+
 __all__ = [
     "allocate",
     "Allocation",
     "LivenessReport",
+    "StackLayout",
+    "SlotLiveness",
+    "pack_slots",
+    "slot_liveness",
     "Program",
     "Block",
     "Instr",
