@@ -151,6 +151,79 @@ def sample_loop_call() -> Program:
     return Program(blocks=(b0, b1, b2), params=(0,), name="loop-call")
 
 
+def sample_remat_pressure() -> Program:
+    """Straight-line pressure with a cheap pure constant (uid 0 -> v1).
+
+    ``v1 = const`` is used only at the very end (uid 8) while four other
+    values are alive around it.  At K=2 the value must be evacuated; with
+    ``remat={0: cost}`` the allocator recomputes the pure constant at its
+    single use instead of writing it to a slot and reloading it, so v1
+    appears in ``Allocation.rematerialized`` rather than ``slots``.
+    """
+    b0 = Block(
+        label="entry",
+        instrs=(
+            Instr(uid=0, uses=(), defs=(1,), note="pure constant (remat)"),
+            Instr(uid=1, uses=(), defs=(2,)),
+            Instr(uid=2, uses=(), defs=(3,)),
+            Instr(uid=3, uses=(), defs=(4,)),
+            Instr(uid=4, uses=(), defs=(5,)),
+            Instr(uid=5, uses=(2, 3), defs=(6,)),
+            Instr(uid=6, uses=(4, 5), defs=(7,)),
+            Instr(uid=7, uses=(6, 7), defs=(8,)),
+            Instr(uid=8, uses=(8, 1), defs=(9,), note="late use of constant"),
+            Instr(uid=9, uses=(9,), defs=(), note="sink"),
+        ),
+        succs=(),
+    )
+    return Program(blocks=(b0,), name="remat-pressure")
+
+
+def sample_remat_phi() -> Program:
+    """A cheap pure value reaches a merge only as a phi source on edges.
+
+    Three edges enter ``merge`` (one is critical).  v1 (a pure constant)
+    is the phi source on every edge while other values keep register
+    pressure high.  With ``remat={0: cost}`` it is recomputed on the edge
+    actions (critical-edge split block included) rather than spilled.
+    """
+    b0 = Block(
+        label="b0",
+        instrs=(
+            Instr(uid=0, uses=(), defs=(1,), note="pure constant (remat)"),
+            Instr(uid=1, uses=(), defs=(2,)),
+            Instr(uid=2, uses=(2,), defs=(7,)),
+        ),
+        succs=(1, 2, 3),
+    )
+    b1 = Block(
+        label="b1",
+        instrs=(
+            Instr(uid=3, uses=(7,), defs=(8,)),
+            Instr(uid=4, uses=(8, 2), defs=(9,)),
+        ),
+        succs=(3,),
+    )
+    b2 = Block(
+        label="b2",
+        instrs=(Instr(uid=5, uses=(7, 2), defs=(10,)),),
+        succs=(3,),
+    )
+    b3 = Block(
+        label="merge",
+        instrs=(
+            Instr(uid=6, uses=(3, 4), defs=(11,)),
+            Instr(uid=7, uses=(11,), defs=()),
+        ),
+        succs=(),
+        phis=(
+            PhiNode(def_var=3, sources=((0, 1), (1, 1), (2, 1))),
+            PhiNode(def_var=4, sources=((0, 7), (1, 9), (2, 10))),
+        ),
+    )
+    return Program(blocks=(b0, b1, b2, b3), name="remat-phi")
+
+
 def generate_pressure_program(seed: int = 20260922, *, width: int = 5,
                               clobber: bool = True) -> Program:
     """Deterministically generated straight-line pressure program.

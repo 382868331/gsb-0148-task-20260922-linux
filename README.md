@@ -33,6 +33,11 @@ from regalloc import (RegAllocError, ProgramFormatError,
 alloc = allocate(program, K)        # K 为 2..8 的 int（拒绝 bool / float）
 ```
 
+可选地用 `allocate(program, K, remat={uid: cost, ...})` 显式标记**允许在使用
+点重新计算的纯操作**及其重算代价（正有限数）。标记即调用方对“该指令纯、
+无副作用、不依赖可变状态”的断言；分配器在寄存器紧张时可以不把该值写入
+内存，而在每个使用位置重新算出它。
+
 - `Program(blocks, params=(), name="")`
   - `blocks`：`Block` 元组，块 0 为唯一入口；给出 `succs`（后继**块下标**）。
     所有块必须从块 0 可达。
@@ -57,12 +62,17 @@ alloc = allocate(program, K)        # K 为 2..8 的 int（拒绝 bool / float�
 | `k` | 使用的寄存器数（寄存器为 r0..rK-1） |
 | `assignment` | `{变量 id: 物理寄存器}`，确定性 |
 | `slots` | `{被 spill 的变量 id: 栈槽号}`；**栈槽号即变量 id** |
+| `rematerialized` | `{被重算的变量 id: 调用方给定的重算代价}`；与 `slots` 不相交 |
 | `allocated_program` | 寄存器级 CFG（`AllocatedProgram`，可用 `.render()` 打印） |
 | `liveness` | `LivenessReport`：块 live-in/live-out、**每条边**活跃集、每条指令 before/after 活跃集 |
 | `iterations` / `history` | spill 迭代次数与每轮被 spill 的变量序列 |
 
-寄存器级指令只有四类：`op`（原指令，含 `reads/writes/clobbers`）、
-`copy`、`load r <- slot`、`store slot <- r`。
+寄存器级指令有五类：`op`（原指令，含 `reads/writes/clobbers`）、
+`copy`、`load r <- slot`、`store slot <- r`、
+`remat r = f(r,...)`（在使用点重放某个纯指令，带原 uid）。
+被重算的值**没有家寄存器也没有栈槽**：其定义点的 `op` 被省略，
+改为在消费前发射一条 `remat`（其操作数通过各自的家寄存器/槽/递归重算
+获得）。`slots` 与 `rematerialized` 因此严格区分“写入内存”与“使用前再生”。
 
 ## 错误语义（先于算法固定的契约）
 
@@ -129,13 +139,33 @@ alloc = allocate(program, K)        # K 为 2..8 的 int（拒绝 bool / float�
 
 6. **不追求最少 spill**：启发式确定性、可解释；正确性优先。
 
+7. **重算（rematerialization）**（`allocator.analyze_remat`）：
+   - 标记是**许可而非命令**。结构上不允许重算的标记直接以
+     `ProgramFormatError` 拒绝：多结果指令、带 `clobbers`（可能是 call
+     副作用）、带 `fixed` 固定寄存器、参数、phi 结果、被重复定义的变量；
+     uid 不存在、代价非正/NaN/Infinity/bool 同样拒绝。
+   - 结构合法但**无法证明每个使用点输入仍有效**的标记只是不会被选中：
+     操作数在使用点必须（按边敏感活跃性）活跃且有唯一静态定义，或本身
+     也是被标记的纯操作（固定点求闭包）。操作数已死亡或依赖不纯值时不
+         重算，避免在循环/分支里读到失效输入。
+   - 每轮染色失败后，选择器在“spill 一个变量”和“重算一个被标记值（含其
+     依赖闭包）”之间按 `(冲突度+1)/加权代价` 比较，循环内使用按 10 的
+     嵌套深度次方加权；同分时确定性地优先重算、再按变量 id 打破平局。
+   - 选中重算前还要通过**内在寄存器需求**检查：保守统计每个使用点（含
+     phi 源所在的前驱边）重放时必然同时存在的临时量与跨指令存活值；若
+     超过 K 个，则该重算动作被放弃、改为 spill，因此**绝不会凭空增加
+     无法分配的临时寄存器**。
+   - `history` 每轮同时记录 `spill:` 与 `remat:` 两个集合（单调增长）。
+
 ## 独立验证
 
 - `regalloc/symbolic.py` 是**独立符号执行器**，不调用分配器核心：
   在 token（溯源）值域里，按确定性有界 DFS 配对执行“原程序 vs 分配后程序”，
   校验相同 uid 顺序、相同符号输入/输出；每条 CFG 边上，边敏感活跃集中的
   变量都带着正确 token 到达其归属位置（家寄存器或栈槽）；call 破坏后的
-  寄存器变为特殊 `CLOBBERED` token，再被读取即判失败。
+  寄存器变为特殊 `CLOBBERED` token，再被读取即判失败。重算（`remat`）
+  时执行器按纯定义的操作数**结构化重算 token**，并核对重放点读到的寄存器
+  token 与源程序该点应有值一致，从而验证“使用前再生”没有引入任何差异。
 - `tests/_reference.py` 提供另外两个独立参考：直接验证活跃性数据流方程、
   以及用独立的并行赋值模拟器比对顺序化后的机器指令效果。
 - 测试中的期望值均为手算/独立推导，**不通过调用被测核心得到**；
@@ -143,7 +173,8 @@ alloc = allocate(program, K)        # K 为 2..8 的 int（拒绝 bool / float�
   删 phi 边拷贝 / 写错栈槽），确认执行器确实有判别力。
 
 覆盖要点：临界边 phi（含自环）、跨 call 活跃值、固定寄存器碰撞、
-寄存器不足触发 spill、预算耗尽与证明无解分离、严格输入拒绝、确定性与可复现。
+寄存器不足触发 spill、**纯值重算（使用点 / phi 边 / 内在超 K 时回退 /
+非纯标记拒绝）**、预算耗尽与证明无解分离、严格输入拒绝、确定性与可复现。
 
 ## 数值口径
 
@@ -158,6 +189,8 @@ alloc = allocate(program, K)        # K 为 2..8 的 int（拒绝 bool / float�
   跨函数全局分配或真实 ABI 调用约定。
 - 指令语义是不透明的（视为 `f(uses)->defs`）；`fixed` 是操作数级约束，
   不是“整个变量全程锁寄存器”。
+- 重算只对调用方显式标记的纯指令开放；分配器不推断纯度。内在寄存器
+  需求检查是**保守过计数**（宁可放弃可重算也不制造无法分配的临时量）。
 - 精确染色在最坏情况下是指数问题；受 `COLORING_BUDGET` 限制，
   超预算时按契约抛 `BudgetExhaustedError`（可行性未知），而非给出可能错误的答案。
 - 符号执行对循环做有界展开（默认深度 80、步数 20,000），结果会标明
@@ -172,7 +205,7 @@ regalloc/
   model.py      数据结构 + 严格输入校验 + 错误类型
   liveness.py   边敏感活跃性（含 phi / 无 phi 两种）
   allocator.py  冲突图、贪心+精确染色、迭代 spill、allocate()
-  lower.py      临界边拆分、并行拷贝顺序化、寄存器/栈代码生成
+  lower.py      临界边拆分、并行拷贝顺序化、寄存器/栈/重算代码生成
   symbolic.py   独立配对符号执行器（前后程序对照）
   samples.py    确定性示例与固定种子程序生成器
 tests/          必要测试（含独立参考 _reference.py 与变异用例）

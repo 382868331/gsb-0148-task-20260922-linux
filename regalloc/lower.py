@@ -6,6 +6,7 @@ Output IR (:class:`AllocatedProgram`) is phi-free and contains only::
     copy   r_dst <- r_src
     load   r_dst <- slot
     store  slot <- r_src
+    remat  r_dst = f(r,..)        # pure op replayed at the use point (uid tagged)
 
 Phi semantics are materialised on the corresponding predecessor *edge*:
 
@@ -31,7 +32,7 @@ from .model import Program
 class MI:
     """One machine-level instruction."""
 
-    kind: str                 # "op" | "copy" | "load" | "store"
+    kind: str                 # "op" | "copy" | "load" | "store" | "remat"
     dst: int = -1
     src: int = -1
     slot: int = -1
@@ -54,6 +55,9 @@ class MI:
             return f"load r{self.dst} <- slot{self.slot}"
         if self.kind == "store":
             return f"store slot{self.slot} <- r{self.src}"
+        if self.kind == "remat":
+            rd = ",".join(f"r{x}" for x in self.reads)
+            return f"remat r{self.dst} = f({rd})  ; replay uid{self.uid}"
         raise AssertionError(self.kind)
 
 
@@ -72,6 +76,7 @@ class AllocatedProgram:
     k: int
     slots: dict[int, int]
     assignment: dict[int, int]
+    rematerialized: dict[int, float]
     scratch_slot: int
     param_regs: dict[int, int]
 
@@ -147,27 +152,46 @@ def _sequential_parallel(actions: list[tuple[str, int, int, int]], scratch_slot:
     return out
 
 
-def lower_program(program: Program, vp: VirtualProgram, color: dict[int, int]) -> AllocatedProgram:
+def lower_program(program: Program, vp: VirtualProgram, color: dict[int, int],
+                  remat_info=None) -> AllocatedProgram:
     n = len(program.blocks)
     blocks = [ABlock(label=b.label, succs=list(b.succs), origin=i) for i, b in enumerate(program.blocks)]
     scratch_slot = program.var_count()
 
     # ---- instruction bodies (pre actions / op / post actions) -------------
+    def emit_materialised(mi_list, actions):
+        """Emit load/remat materialisation actions in recorded order."""
+        for kind, a, x, *rest in actions:
+            if kind == "load":
+                mi_list.append(MI(kind="load", dst=color[a], slot=x))
+            else:  # remat: x is the def uid, rest[0] are operand nodes
+                op_nodes = rest[0]
+                mi_list.append(MI(
+                    kind="remat", dst=color[a],
+                    reads=tuple(color[o] for o in op_nodes), uid=x,
+                ))
+
     for i, b in enumerate(program.blocks):
         for ins in b.instrs:
             plan: InstrPlan = vp.instr_plans[ins.uid]
-            for kind, a, v in plan.pre:
+            for kind, a, v, *rest in plan.pre:
                 if kind == "load":
                     blocks[i].instrs.append(MI(kind="load", dst=color[a], slot=v))
+                elif kind == "remat":
+                    blocks[i].instrs.append(MI(
+                        kind="remat", dst=color[a],
+                        reads=tuple(color[o] for o in rest[0]), uid=v,
+                    ))
                 else:  # copy pseudo <- operand
                     if color[a] != color[v]:
                         blocks[i].instrs.append(MI(kind="copy", dst=color[a], src=color[v]))
-            reads = tuple(color[r] for r in plan.reads)
-            writes = tuple(color[w] for w in plan.writes)
-            blocks[i].instrs.append(
-                MI(kind="op", reads=reads, writes=writes,
-                   clobbers=tuple(sorted(set(ins.clobbers))), uid=ins.uid, note=ins.note)
-            )
+            if not plan.elided:
+                reads = tuple(color[r] for r in plan.reads)
+                writes = tuple(color[w] for w in plan.writes)
+                blocks[i].instrs.append(
+                    MI(kind="op", reads=reads, writes=writes,
+                       clobbers=tuple(sorted(set(ins.clobbers))), uid=ins.uid, note=ins.note)
+                )
             for kind, a, v in plan.post:
                 if kind == "store":
                     blocks[i].instrs.append(MI(kind="store", src=color[a], slot=v))
@@ -177,8 +201,8 @@ def lower_program(program: Program, vp: VirtualProgram, color: dict[int, int]) -
 
     # ---- edge actions: append or split -------------------------------------
     def emit_edge_actions(mi_list: list[MI], ep: EdgePlan) -> None:
-        for kind, t, svar in ep.loads:
-            mi_list.append(MI(kind="load", dst=color[t], slot=svar))
+        emit_materialised(mi_list, ep.loads)
+        emit_materialised(mi_list, ep.remats)
         actions: list[tuple[str, int, int, int]] = []
         for kind, d, s in ep.copies:
             rd, rs = color[d], color[s]
@@ -189,7 +213,7 @@ def lower_program(program: Program, vp: VirtualProgram, color: dict[int, int]) -
 
     extra: list[ABlock] = []
     for (p, q), ep in vp.edge_plans.items():
-        if not ep.loads and not ep.copies and not ep.stores:
+        if not ep.loads and not ep.remats and not ep.copies and not ep.stores:
             continue
         if len(program.blocks[p].succs) == 1:
             emit_edge_actions(blocks[p].instrs, ep)
@@ -213,6 +237,8 @@ def lower_program(program: Program, vp: VirtualProgram, color: dict[int, int]) -
         k=_k_from_color(color),
         slots=slots,
         assignment=assignment,
+        rematerialized={v: remat_info.costs[remat_info.eligible[v]]
+                         for v in sorted(vp.rematerialized)} if remat_info else {},
         scratch_slot=scratch_slot,
         param_regs={v: assignment[v] for v in program.params if v in assignment},
     )

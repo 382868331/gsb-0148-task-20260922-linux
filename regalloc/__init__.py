@@ -21,6 +21,7 @@ from .allocator import (
     ProgramFormatError,
     InfeasibleProgramError,
     BudgetExhaustedError,
+    RematInfo,
     allocate,
 )
 from .liveness import LivenessReport
@@ -37,4 +38,5 @@ __all__ = [
     "ProgramFormatError",
     "InfeasibleProgramError",
     "BudgetExhaustedError",
+    "RematInfo",
 ]

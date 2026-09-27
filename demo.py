@@ -28,6 +28,7 @@ from regalloc.liveness import liveness_with_phis
 from regalloc.samples import (
     sample_call_surviving,
     sample_fixed_collision,
+    sample_remat_pressure,
     sample_register_pressure,
 )
 from regalloc.symbolic import equivalence_check
@@ -87,6 +88,27 @@ def show_call_clobber() -> None:
     print(allocate(prog, 3).allocated_program.render())
 
 
+def show_rematerialisation() -> None:
+    hr("2b) REMATERIALISATION — cheap pure constant recomputed at its use")
+    prog = sample_remat_pressure()
+    print("program:", prog.name)
+    print("uid0 (v1) is a pure constant used only at uid8; caller marks it")
+    print("rematerialisable with remat={0: <cost>} (cost is asserted purity).")
+
+    plain = allocate(prog, 2)
+    marked = allocate(prog, 2, remat={0: 1})
+    print("\nK=2 without marker  -> slots:", sorted(plain.slots))
+    print("K=2 with remat={0:1} -> slots:", sorted(marked.slots),
+          " rematerialized:", marked.rematerialized)
+    assert 1 in plain.slots and 1 in marked.rematerialized
+    assert 1 not in marked.slots
+    print("\nlowered code (notice uid0 is elided; 'remat' appears at uid8):")
+    print(marked.allocated_program.render())
+    res = equivalence_check(prog, marked)
+    print("\nsymbolic before/after equivalence:", res.summary())
+    assert res.equivalent, res.failure
+
+
 def show_rejection_boundary() -> None:
     hr("3) ACTUALLY TRIGGERED REJECTION / EXCEPTION BOUNDARIES")
 
@@ -124,6 +146,7 @@ def main() -> None:
     t0 = time.perf_counter()
     show_normal_spill()
     show_call_clobber()
+    show_rematerialisation()
     show_rejection_boundary()
     hr("DEMO COMPLETE")
     print(f"total wall time: {time.perf_counter() - t0:.2f} s")

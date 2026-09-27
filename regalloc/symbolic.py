@@ -73,8 +73,32 @@ def equivalence_check(
     ap = allocation.allocated_program
     colors = allocation.assignment
     spilled = set(allocation.slots)
+    rematerialized = set(getattr(allocation, "rematerialized", {}))
     k = allocation.k
     report = liveness_with_phis(program)
+
+    uid_to_ins: dict[int, object] = {}
+    for blk in program.blocks:
+        for ins in blk.instrs:
+            uid_to_ins[ins.uid] = ins
+    remat_uid_by_var: dict[int, int] = {}
+    for blk in program.blocks:
+        for ins in blk.instrs:
+            if len(ins.defs) == 1 and ins.defs[0] in rematerialized:
+                remat_uid_by_var[ins.defs[0]] = ins.uid
+
+    def src_token(u: int, env: dict[int, Any]):
+        """The token the source program gives variable ``u`` right now.
+
+        A rematerialised variable holds no persistent home value; its token
+        is the one its pure definition would produce from the current
+        operands (token equality is structural, so a replay at any point
+        yields the same token as the elided definition).
+        """
+        if u in remat_uid_by_var:
+            ins = uid_to_ins[remat_uid_by_var[u]]
+            return _op_token(ins.uid, tuple(src_token(x, env) for x in ins.uses), 0)
+        return env.get(u, UNINITIALIZED)
 
     n = len(program.blocks)
     orig_to_ab: dict[int, int] = {}
@@ -88,7 +112,7 @@ def equivalence_check(
     bound_reached = False
 
     def loc_for_var(v: int, regs: dict[int, Any], slots: dict[int, Any]):
-        if v in spilled:
+        if v in spilled or v in rematerialized:
             return slots.get(v, UNINITIALIZED)
         if v not in colors:
             return UNINITIALIZED
@@ -118,14 +142,26 @@ def equivalence_check(
                 return f"allocated CFG desync at source block {cur}"
 
             op_indices = [i for i, mi in enumerate(ab.instrs) if mi.kind == "op"]
-            if len(op_indices) != len(sb.instrs):
+            elided_uids = {
+                ins.uid for ins in sb.instrs
+                if ins.defs and all(d in rematerialized for d in ins.defs)
+            }
+            if len(op_indices) != len(sb.instrs) - len(elided_uids):
                 return f"op count mismatch in block {cur}"
-            last_op_idx = op_indices[-1] if op_indices else -1
-            dst_ops = [ab.instrs[i] for i in op_indices]
+            if ab.instrs:
+                last_body_idx = max(
+                    (i for i, mi in enumerate(ab.instrs)
+                     if mi.kind in ("op", "remat")),
+                    default=-1,
+                )
+            else:
+                last_body_idx = -1
 
             # ---- paired body: prefix through the last op ----
             src_i = 0
-            for idx in range(last_op_idx + 1):
+            pending_remat: dict[int, tuple] = {}
+
+            for idx in range(last_body_idx + 1):
                 mi = ab.instrs[idx]
                 if mi.kind == "copy":
                     regs[mi.dst] = regs[mi.src]
@@ -133,11 +169,29 @@ def equivalence_check(
                     regs[mi.dst] = slots.get(mi.slot, UNINITIALIZED)
                 elif mi.kind == "store":
                     slots[mi.slot] = regs[mi.src]
+                elif mi.kind == "remat":
+                    ins = uid_to_ins[mi.uid]
+                    src_inputs = tuple(src_token(u, env) for u in ins.uses)
+                    dst_inputs = tuple(regs[r] for r in mi.reads)
+                    if src_inputs != dst_inputs:
+                        return (
+                            f"input mismatch at remat uid {ins.uid} (block {cur}): "
+                            f"src={src_inputs} dst={dst_inputs}"
+                        )
+                    if any(t is CLOBBERED or t is UNINITIALIZED for t in dst_inputs):
+                        return f"clobbered/uninitialized register read at remat uid {ins.uid}"
+                    tok = _op_token(ins.uid, src_inputs, 0)
+                    regs[mi.dst] = tok
                 elif mi.kind == "op":
+                    # advance past elided (remat) source instructions
+                    while src_i < len(sb.instrs) and sb.instrs[src_i].uid in elided_uids:
+                        src_i += 1
+                    if src_i >= len(sb.instrs):
+                        return f"unexpected machine op in block {cur}"
                     ins = sb.instrs[src_i]
                     if mi.uid != ins.uid:
                         return f"uid order mismatch in block {cur}"
-                    src_inputs = tuple(env[u] for u in ins.uses)
+                    src_inputs = tuple(src_token(u, env) for u in ins.uses)
                     dst_inputs = tuple(regs[r] for r in mi.reads)
                     if src_inputs != dst_inputs:
                         return (
@@ -173,18 +227,30 @@ def equivalence_check(
             qb = program.blocks[q]
             pre_edge_env = dict(env)
 
-            # ---- edge transition on the allocated side ----
-            # 1) tail of the current block (edge code when edge not split)
-            for idx in range(last_op_idx + 1, len(ab.instrs)):
-                mi = ab.instrs[idx]
+            def step_edge_mi(mi):
                 if mi.kind == "op":
-                    return f"unexpected op after edge boundary in block {cur}"
+                    return "unexpected op after edge boundary"
                 if mi.kind == "copy":
                     regs[mi.dst] = regs[mi.src]
                 elif mi.kind == "load":
                     regs[mi.dst] = slots.get(mi.slot, UNINITIALIZED)
                 elif mi.kind == "store":
                     slots[mi.slot] = regs[mi.src]
+                elif mi.kind == "remat":
+                    ins = uid_to_ins[mi.uid]
+                    src_inputs = tuple(src_token(u, pre_edge_env) for u in ins.uses)
+                    dst_inputs = tuple(regs[r] for r in mi.reads)
+                    if src_inputs != dst_inputs:
+                        return (f"input mismatch at edge remat uid {ins.uid}")
+                    regs[mi.dst] = _op_token(ins.uid, src_inputs, 0)
+                return None
+
+            # ---- edge transition on the allocated side ----
+            # 1) tail of the current block (edge code when edge not split)
+            for idx in range(last_body_idx + 1, len(ab.instrs)):
+                err = step_edge_mi(ab.instrs[idx])
+                if err:
+                    return f"{err} in block {cur}"
 
             # 2) follow the successor chain (possibly through split blocks)
             t = acur
@@ -200,12 +266,9 @@ def equivalence_check(
                 if any(mi.kind == "op" for mi in cb.instrs):
                     return f"split block {cb.label} unexpectedly contains an op"
                 for mi in cb.instrs:
-                    if mi.kind == "copy":
-                        regs[mi.dst] = regs[mi.src]
-                    elif mi.kind == "load":
-                        regs[mi.dst] = slots.get(mi.slot, UNINITIALIZED)
-                    elif mi.kind == "store":
-                        slots[mi.slot] = regs[mi.src]
+                    err = step_edge_mi(mi)
+                    if err:
+                        return f"{err} in split block {cb.label}"
             acur = target
 
             # 3) edge-sensitive live values must be in their home locations.
@@ -219,6 +282,8 @@ def equivalence_check(
             for v in report.edge_live[(cur, q)]:
                 if v in phi_srcs_here:
                     continue
+                if v in rematerialized:
+                    continue
                 tok = pre_edge_env.get(v, UNINITIALIZED)
                 got = loc_for_var(v, regs, slots)
                 if got != tok:
@@ -230,12 +295,14 @@ def equivalence_check(
             # 4) source-side phi application (all source tokens come from the
             # pre-edge snapshot); phi results must land in their home slot
             phi_pairs = [
-                (phi.def_var, pre_edge_env[dict(phi.sources)[cur]])
+                (phi.def_var, src_token(dict(phi.sources)[cur], pre_edge_env))
                 for phi in qb.phis
             ]
             for d, tok in phi_pairs:
                 env[d] = tok
             for d, tok in phi_pairs:
+                if d in rematerialized:
+                    continue
                 got = loc_for_var(d, regs, slots)
                 if got != tok:
                     return f"edge {cur}->{q}: phi result v{d} = {got!r}, expected {tok!r}"
