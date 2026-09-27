@@ -334,6 +334,94 @@ class Program:
         return m + 1
 
 
+# ---- rematerialisation policy ---------------------------------------------
+
+@dataclass(frozen=True)
+class RematSpec:
+    """Caller-supplied policy: which pure instructions may be recomputed.
+
+    ``costs`` maps an instruction ``uid`` to a non-negative integer
+    rematerialisation cost, comparable to one load/store round trip; 0
+    marks a value literally computable from constants with no operand
+    reads (e.g. a load-immediate).  Marking an instruction is a
+    *permission*: the allocator recomputes its result(s) near a use
+    instead of keeping the value (or spilling it) only when that relieves
+    register pressure.
+
+    Only *pure* instructions may be marked: no ``clobbers`` (call-like
+    instructions destroy state), no ``fixed`` operand requirements, and
+    at least one def.  A phi result is never rematerialisable (it has no
+    single definition site).  The caller makes the purity promise; only
+    structural properties are checked here.
+    """
+
+    costs: dict[int, int] = field(default_factory=dict)
+
+    def __post_init__(self) -> None:
+        if not isinstance(self.costs, dict):
+            raise _err("remat", "expected a mapping {uid: cost}")
+        costs: dict[int, int] = {}
+        for key, value in self.costs.items():
+            if isinstance(key, bool):
+                raise _err("remat", "boolean instruction uid is not allowed")
+            if isinstance(key, str) and key.lstrip("-").isdigit():
+                uid = int(key)
+            elif isinstance(key, int) and not isinstance(key, bool):
+                uid = key
+            else:
+                raise _err("remat", f"bad instruction uid key: {key!r}")
+            check_int(uid, "remat(uid)", minimum=0)
+            check_int(value, f"remat[{uid}]", minimum=0)
+            costs[uid] = value
+        object.__setattr__(self, "costs", costs)
+
+    @classmethod
+    def coerce(cls, obj: Any) -> "RematSpec":
+        """Accept a :class:`RematSpec` or a plain ``{uid: cost}`` dict."""
+        if isinstance(obj, RematSpec):
+            return obj
+        if obj is None:
+            return cls()
+        if isinstance(obj, dict):
+            return cls(costs=obj)
+        raise _err("remat", "expected a RematSpec or {uid: cost} dict")
+
+
+def validate_remat_spec(program: Program, spec: RematSpec) -> None:
+    """Cross-check a rematerialisation policy against a concrete program.
+
+    Every marked uid must exist, define at least one variable, be free of
+    call clobbers and fixed-register requirements.  Errors carry
+    locatable paths; the function is side-effect free.
+    """
+    by_uid: dict[int, tuple[int, Instr]] = {}
+    for bi, block in enumerate(program.blocks):
+        for ins in block.instrs:
+            by_uid[ins.uid] = (bi, ins)
+    for uid in sorted(spec.costs):
+        if uid not in by_uid:
+            raise _err(f"remat[{uid}]", "no instruction with this uid")
+        bi, ins = by_uid[uid]
+        path = f"blocks[{bi}].instrs uid={uid}"
+        if not ins.defs:
+            raise _err(
+                f"remat[{uid}]",
+                f"{path} defines nothing; a recomputed value needs a def",
+            )
+        if ins.clobbers:
+            raise _err(
+                f"remat[{uid}]",
+                f"{path} clobbers registers; only pure side-effect-free "
+                f"operations may be rematerialised",
+            )
+        if ins.fixed:
+            raise _err(
+                f"remat[{uid}]",
+                f"{path} has fixed-register operands; it cannot be freely "
+                f"recomputed at arbitrary use points",
+            )
+
+
 # ---- dict (e.g. JSON) construction ----------------------------------------
 
 def _at(prefix: str, i: int) -> str:

@@ -33,7 +33,9 @@ from .model import (
     Program,
     ProgramFormatError,
     RegAllocError,
+    RematSpec,
     check_int,
+    validate_remat_spec,
 )
 
 # Backtracking assignments tried before feasibility is declared "unknown".
@@ -55,13 +57,16 @@ class InstrPlan:
     reads: list[int] = field(default_factory=list)
     writes: list[int] = field(default_factory=list)
     post: list[tuple] = field(default_factory=list)
+    skipped: bool = False
 
 
 @dataclass
 class EdgePlan:
     pred: int
     succ: int
-    loads: list[tuple] = field(default_factory=list)   # before copies
+    # pre holds, in emission order, ("load", dst_node, slot_var) and
+    ("remat", dst_node, uid, def_var) recomputation chains
+    pre: list[tuple] = field(default_factory=list)
     copies: list[tuple] = field(default_factory=list)  # ("copy", d, s)
     stores: list[tuple] = field(default_factory=list)  # after copies
 
@@ -75,6 +80,8 @@ class VirtualProgram:
     real_nodes: set[int]
     temp_nodes: set[int]
     spilled: set[int]
+    remat: set[int]                    # variables recomputed at use points
+    remat_uids: set[int]               # uids selected for rematerialisation
     loop_depth: dict[int, int]
     # A spilled parameter is stack-passed: its value lives in its spill slot
     # from the entry point and never occupies a register there.
@@ -142,7 +149,216 @@ def _occurrence_weights(program: Program) -> dict[int, int]:
     return w
 
 
-def build_virtual_program(program: Program, spilled: set[int]) -> VirtualProgram:
+def _dominators(program: Program) -> list[set[int]]:
+    """Dominator sets (block 0 is the unique entry)."""
+    n = len(program.blocks)
+    preds = predecessors(program.blocks)
+    dom: list[set[int]] = [set(range(n)) for _ in range(n)]
+    dom[0] = {0}
+    changed = True
+    while changed:
+        changed = False
+        for i in range(1, n):
+            new = {i} | (set.intersection(*(dom[p] for p in preds[i])) if preds[i] else set())
+            if new != dom[i]:
+                dom[i] = new
+                changed = True
+    return dom
+
+
+def _def_locations(program: Program):
+    """Map each variable to its unique definition site.
+
+    Returns ``(def_of, def_block, def_index, uid_of)``: ``def_of`` is
+    ``"param"``, ``"phi"`` or ``(block, instr_index)``; a multiply
+    defined variable maps to ``None`` (the SSA-style programs handled
+    here normally define every variable once).
+    """
+    n = len(program.blocks)
+    loc: dict[int, object] = {v: "param" for v in program.params}
+    def_block: dict[int, int] = {}
+    def_index: dict[int, int] = {}
+    uid_of: dict[int, int] = {}
+    multi: set[int] = set()
+    for bi, block in enumerate(program.blocks):
+        for ii, ins in enumerate(block.instrs):
+            for d in ins.defs:
+                if d in loc:
+                    multi.add(d)
+                loc[d] = (bi, ii)
+                def_block[d] = bi
+                def_index[d] = ii
+                uid_of[d] = ins.uid
+        for phi in block.phis:
+            d = phi.def_var
+            if d in loc:
+                multi.add(d)
+            loc[d] = "phi"
+            def_block[d] = bi
+    for d in multi:
+        loc[d] = None
+    return loc, def_block, def_index, uid_of
+
+
+def _consumption_points(program: Program, uid: int):
+    """All points where the defs of instruction ``uid`` are consumed.
+
+    Points are ``("body", block, instr_index)`` (a use inside an
+    instruction) or ``("edge", pred, succ)`` (a phi source read on that
+    edge).  Uses of an instruction that is itself selected for
+    rematerialisation are *not* consumption points: that instruction no
+    longer executes at its definition site, so its operands are demanded
+    only at its replays.
+    """
+    remat_uids_here = {uid}
+    defs: set[int] = set()
+    for block in program.blocks:
+        for ins in block.instrs:
+            if ins.uid == uid:
+                defs = set(ins.defs)
+    points: list[tuple] = []
+    for bi, block in enumerate(program.blocks):
+        for ii, ins in enumerate(block.instrs):
+            if ins.uid in remat_uids_here:
+                continue
+            if defs & set(ins.uses):
+                points.append(("body", bi, ii))
+        for succ in block.succs:
+            sb = program.blocks[succ]
+            for phi in sb.phis:
+                src = dict(phi.sources).get(bi)
+                if src in defs:
+                    points.append(("edge", bi, succ))
+    return points
+
+
+def _remat_eligibility(program: Program, spec: RematSpec):
+    """Static feasibility of rematerialising each marked instruction.
+
+    A marked instruction is feasible only if, at *every* consumption
+    point of every value it defines, each register-resident operand is
+    already valid there (its definition dominates the point and it is
+    live there) or is itself recomputable there (recursively).  This
+    guarantees a replay in a branch or loop never reads a stale or
+    uninitialised input.  Stack-passed parameters live in their slot and
+    are always available (reloaded).
+
+    Returns ``(feasible_uids, reason_by_uid, weight_by_uid)`` where the
+    weight is the loop-weighted number of replays (x10 per nesting level).
+    """
+    depths = _compute_loop_depths(program)
+    dom = _dominators(program)
+    report = liveness_with_phis(program)
+    loc, def_block, _def_index, _uid_of = _def_locations(program)
+    stack_params = set(program.params)  # availability checked at use time
+    # Marked instruction lookup and its own defs/uses.
+    instr_of_uid: dict[int, tuple[int, Instr]] = {}
+    for bi, block in enumerate(program.blocks):
+        for ins in block.instrs:
+            instr_of_uid[ins.uid] = (bi, ins)
+
+    feasible: set[int] = set()
+    reasons: dict[int, str] = {}
+
+    def point_block(point) -> int:
+        return point[1] if point[0] == "body" else point[1]
+
+    def live_at(v: int, point) -> bool:
+        if point[0] == "body":
+            _, bi, ii = point
+            return v in report.instr_before[bi][ii]
+        _, p, q = point
+        return v in report.edge_live[(p, q)]
+
+    def dominates(def_b: int, point) -> bool:
+        if point[0] == "body":
+            _, bi, ii = point
+            if def_b == bi:
+                # same block: the def must precede the consuming instr
+                if loc.get(v_holder[0]) == ("param",):  # pragma: no cover
+                    pass
+                dl = loc.get(v_holder[0])
+                return isinstance(dl, tuple) and dl == (bi, ii) and dl[1] <= ii or def_b != bi and False
+            return bi in dom and def_b in dom[bi]
+        # edge point p->q: value is read by phi edge copies at end of p
+        _, p, _q = point
+        return p in dom[p] if False else (def_b == p or p in dom[p] and def_b in dom[p])
+
+    # The helper above is rewritten cleanly below using per-variable data.
+    v_holder: list[int] = [0]
+
+    def operand_available(v: int, point, stack: tuple[int, ...]) -> bool:
+        if v in stack_params:
+            return True
+        dl = loc.get(v)
+        if dl is None or dl == "phi":
+            return False
+        db, di = dl
+        kind = point[0]
+        if kind == "body":
+            _, bi, ii = point
+            if db == bi:
+                if di > ii:
+                    return False
+            elif bi not in dom or db not in dom[bi]:
+                return False
+            if v not in report.instr_before[bi][ii]:
+                return False
+        else:
+            _, p, _q = point
+            if db != p and p not in dom[p] and False:
+                return False
+            if db != p and db not in dom[p]:
+                return False
+            if v not in report.edge_live[(p, _q)]:
+                return False
+        # if v is itself produced by a marked instruction, that replay must
+        # be feasible in the same context
+        owner = uid_of_var.get(v)
+        if owner is not None and owner in spec.costs:
+            if v in stack:
+                return False
+            return uid_feasible(owner, point, stack + (v,))
+        return True
+
+    uid_of_var: dict[int, int] = {}
+    for bi2, block2 in enumerate(program.blocks):
+        for ins2 in block2.instrs:
+            for d2 in ins2.defs:
+                uid_of_var[d2] = ins2.uid
+
+    uid_memo: dict[tuple[int, tuple], bool] = {}
+
+    def uid_feasible(owner: int, point, stack: tuple[int, ...]) -> bool:
+        key = (owner, point, stack)
+        if key in uid_memo:
+            return uid_memo[key]
+        ins = instr_of_uid[owner][1]
+        ok = all(operand_available(u, point, stack) for u in ins.uses)
+        uid_memo[key] = ok
+        return ok
+
+    weights: dict[int, int] = {}
+    for uid in sorted(spec.costs):
+        if uid not in instr_of_uid:
+            continue  # program-level validation reports this
+        points = _consumption_points(program, uid)
+        weights[uid] = sum(10 ** depths[point_block(pt)] for pt in points)
+        bad = next((pt for pt in points
+                    if not all(operand_available(u, pt, ())
+                               for u in instr_of_uid[uid][1].uses)), None)
+        if bad is None:
+            feasible.add(uid)
+        else:
+            reasons[uid] = (
+                f"an operand is not valid at consumption point {bad} "
+                f"(replay there would read a dead/uninitialised value)"
+            )
+    return feasible, reasons, weights
+
+
+def build_virtual_program(program: Program, spilled: set[int],
+                          remat_uids: set[int] | None = None) -> VirtualProgram:
     """Construct nodes/edges/plans for one concrete spilled-set attempt."""
     blocks = program.blocks
     n = len(blocks)
